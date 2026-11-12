@@ -1,1 +1,8 @@
 .DS_Store
+/target/
+/output/
+/qa/
+/tmp/
+*.ans
+!/assets/JetBrainsMono-Regular.ttf
+!/assets/OFL.txt
