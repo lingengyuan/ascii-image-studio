@@ -313,12 +313,16 @@ fn nearest_glyph<'a>(
         .expect("ASCII atlas is not empty")
 }
 
-/// 渲染亮度是 `alpha` 倍的字形覆盖率，按调制后的形状比较才能消除中间调二次压暗。
+/// 形状按原始覆盖率比较，亮度由密度项按 `alpha` 补偿。
+///
+/// 在形状距离里再乘 `alpha` 会抬高中间调的目标覆盖率，平坦区域全部选中最密的字形，
+/// 五官轮廓被高密度纹理淹没。去掉这层调制后，轮廓仍由线条字符表达，
+/// 中间调变暗的问题由密度正则项负责修正。
 fn glyph_cost(glyph: &CharGlyph, target: &[f32; SHAPE_DIMS], terms: &MatchingTerms) -> f32 {
     let distance: f32 = target
         .iter()
         .zip(glyph.shape_vec.iter())
-        .map(|(target, shape)| (*target - terms.alpha * *shape).powi(2))
+        .map(|(target, shape)| (*target - *shape).powi(2))
         .sum();
     let density = shape_density(glyph.shape_vec) * terms.density_scale;
     terms.shape_weight * distance + 1.5 * (terms.y_mean - terms.alpha * density).powi(2)
@@ -467,7 +471,7 @@ mod tests {
     use image::{DynamicImage, Rgb, RgbImage};
 
     use super::{
-        MatchConfig, MatchedArt, directional_ascii, internal_samples, match_image, mean_region,
+        MatchConfig, directional_ascii, internal_samples, match_image, mean_region,
         scale_to_density,
     };
     use crate::font_atlas::FontAtlas;
@@ -656,21 +660,29 @@ mod tests {
     }
 
     #[test]
-    fn modulated_matching_compensates_for_foreground_brightness() {
+    fn flat_midtone_selects_same_glyph_with_and_without_foreground_modulation() {
+        // 平坦区域没有轮廓，前景亮度调制只应改变密度正则项的目标。
+        // 把 alpha 乘回形状距离会抬高中间调的目标覆盖率，两种模式就会选出不同字形。
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 40, Rgb([128, 128, 128])));
         let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
         let atlas = FontAtlas::load().unwrap();
         let mut modulated = config(false);
         modulated.plain_text = false;
 
-        let mean_density = |art: &MatchedArt| {
-            art.cells.iter().map(|cell| cell.density).sum::<f32>() / art.cells.len() as f32
-        };
-        let modulated_density = mean_density(&match_image(&processed, &atlas, &modulated).unwrap());
-        let plain_density = mean_density(&match_image(&processed, &atlas, &config(false)).unwrap());
-        assert!(
-            modulated_density > plain_density + 0.05,
-            "modulated={modulated_density}, plain={plain_density}"
+        let modulated_art = match_image(&processed, &atlas, &modulated).unwrap();
+        let plain_art = match_image(&processed, &atlas, &config(false)).unwrap();
+        assert_eq!(
+            modulated_art
+                .cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<Vec<_>>(),
+            plain_art
+                .cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<Vec<_>>(),
+            "平坦中间调下两种匹配模式应选中同一字形"
         );
     }
 
