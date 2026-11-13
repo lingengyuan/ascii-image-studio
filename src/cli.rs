@@ -26,15 +26,15 @@ pub struct Cli {
     pub output: Option<PathBuf>,
 
     /// 对比度幂指数，作用于色调映射后的亮度
-    #[arg(short = 'c', long, default_value_t = 1.1, value_parser = positive_finite_f32)]
+    #[arg(short = 'c', long, default_value_t = 1.3, value_parser = positive_finite_f32)]
     pub contrast: f32,
 
     /// 亮度色调映射：clahe 为局部均衡，global 为全局拉伸（旧版色调曲线）
     #[arg(long, value_enum, default_value = "clahe")]
     pub tone_map: ToneMap,
 
-    /// 形状向量相对亮度密度的权重；强边缘提高，平坦区域降低
-    #[arg(short = 'd', long, default_value_t = 1.4, value_parser = positive_finite_f32)]
+    /// 外部邻域方向锐化指数
+    #[arg(short = 'd', long, default_value_t = 2.5, value_parser = positive_finite_f32)]
     pub dir_crunch: f32,
 
     /// 有符号 DoG 锐化权重；0 表示关闭
@@ -126,9 +126,9 @@ mod tests {
     fn defaults_match_cli_contract() {
         let cli = Cli::try_parse_from(["tool", "input.png"]).unwrap();
         assert_eq!(cli.width, None);
-        assert_eq!(cli.contrast, 1.1);
+        assert_eq!(cli.contrast, 1.3);
         assert_eq!(cli.tone_map, ToneMap::Clahe);
-        assert_eq!(cli.dir_crunch, 1.4);
+        assert_eq!(cli.dir_crunch, 2.5);
         assert_eq!(cli.edge_weight, 0.25);
     }
 

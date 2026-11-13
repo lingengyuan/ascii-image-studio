@@ -476,7 +476,7 @@ fn cli_mono_png_uses_cell_luminance_for_foreground() {
             .pixels()
             .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
     );
-    assert_eq!(rendered.pixels().map(|pixel| pixel[0]).max(), Some(182));
+    assert_eq!(rendered.pixels().map(|pixel| pixel[0]).max(), Some(160));
 }
 
 #[test]

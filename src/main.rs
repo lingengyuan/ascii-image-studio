@@ -37,7 +37,6 @@ fn run(cli: Cli) -> Result<()> {
         dither: cli.dither,
         color: cli.color,
         braille: cli.braille,
-        plain_text: output_kind == OutputKind::Txt,
     };
     let art = match_image(&processed, &atlas, &config)?;
     render(&art, output_kind, cli.output.as_deref())

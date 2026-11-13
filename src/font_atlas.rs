@@ -3,9 +3,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use fontdue::{Font, FontSettings};
 
-use crate::preprocess::{
-    CELL_HEIGHT, CELL_WIDTH, SHAPE_DIMS, fractional_mean, shape_bounds, shape_density,
-};
+use crate::preprocess::{CELL_HEIGHT, CELL_WIDTH, cell_region_bounds};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.ttf");
 const CELL_PIXELS: usize = (CELL_WIDTH * CELL_HEIGHT) as usize;
@@ -13,7 +11,7 @@ const CELL_PIXELS: usize = (CELL_WIDTH * CELL_HEIGHT) as usize;
 #[derive(Clone, Debug)]
 pub struct CharGlyph {
     pub ch: char,
-    pub shape_vec: [f32; SHAPE_DIMS],
+    pub shape_vec: [f32; 6],
     pub density: f32,
     pub bitmap: Arc<[u8]>,
 }
@@ -21,8 +19,6 @@ pub struct CharGlyph {
 pub struct FontAtlas {
     ascii: Vec<CharGlyph>,
     braille_bitmaps: Vec<Arc<[u8]>>,
-    /// 归一化形状密度的倒数，最密字形映射为 1。
-    density_scale: f32,
 }
 
 pub const BRAILLE_LAYOUT: [(usize, usize); 8] = [
@@ -63,26 +59,17 @@ impl FontAtlas {
         }
 
         normalize_shape_vectors(&mut ascii);
-        let max_density = ascii
-            .iter()
-            .map(|glyph| shape_density(glyph.shape_vec))
-            .fold(0.0_f32, f32::max);
         let braille_bitmaps = (0..=255)
             .map(|bits| Arc::<[u8]>::from(render_braille_bitmap(bits)))
             .collect();
         Ok(Self {
             ascii,
             braille_bitmaps,
-            density_scale: 1.0 / max_density.max(1.0e-6),
         })
     }
 
     pub fn ascii(&self) -> &[CharGlyph] {
         &self.ascii
-    }
-
-    pub fn density_scale(&self) -> f32 {
-        self.density_scale
     }
 
     pub fn ascii_bitmap(&self, ch: char) -> Arc<[u8]> {
@@ -149,24 +136,24 @@ fn rasterize_centered(font: &Font, ch: char, size: f32, baseline: f32) -> Result
     Ok(canvas)
 }
 
-fn raw_shape_vector(bitmap: &[u8]) -> [f32; SHAPE_DIMS] {
-    let coverage: Vec<f32> = bitmap
-        .iter()
-        .map(|value| f32::from(*value) / 255.0)
-        .collect();
-    std::array::from_fn(|component| {
-        fractional_mean(
-            &coverage,
-            CELL_WIDTH as usize,
-            CELL_HEIGHT as usize,
-            shape_bounds(component),
-        )
-    })
+fn raw_shape_vector(bitmap: &[u8]) -> [f32; 6] {
+    let mut shape = [0.0_f32; 6];
+    for (component, value) in shape.iter_mut().enumerate() {
+        let (x0, y0, x1, y1) = cell_region_bounds(0, 0, component);
+        let mut count = 0_u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                *value += f32::from(bitmap[y as usize * CELL_WIDTH as usize + x as usize]) / 255.0;
+                count += 1;
+            }
+        }
+        *value /= count as f32;
+    }
+    shape
 }
 
-/// 逐维归一到字体能达到的最大覆盖率，让不同字形在同一尺度上比较。
 fn normalize_shape_vectors(glyphs: &mut [CharGlyph]) {
-    let mut maxima = [0.0_f32; SHAPE_DIMS];
+    let mut maxima = [0.0_f32; 6];
     for glyph in glyphs.iter() {
         for (maximum, value) in maxima.iter_mut().zip(glyph.shape_vec) {
             *maximum = maximum.max(value);
@@ -210,7 +197,7 @@ pub fn render_braille_bitmap(bits: u8) -> [u8; 200] {
 #[cfg(test)]
 mod tests {
     use super::{BRAILLE_LAYOUT, FontAtlas, braille_char, render_braille_bitmap};
-    use crate::preprocess::{CELL_HEIGHT, CELL_WIDTH, SHAPE_DIMS};
+    use crate::preprocess::{CELL_HEIGHT, CELL_WIDTH};
 
     #[test]
     fn ascii_atlas_has_all_characters_and_no_clipping() {
@@ -230,10 +217,10 @@ mod tests {
     fn space_is_empty_and_shape_components_are_normalized_by_dimension() {
         let atlas = FontAtlas::load().unwrap();
         let space = &atlas.ascii()[0];
-        assert_eq!(space.shape_vec, [0.0; SHAPE_DIMS]);
+        assert_eq!(space.shape_vec, [0.0; 6]);
         assert_eq!(space.density, 0.0);
 
-        for component in 0..SHAPE_DIMS {
+        for component in 0..6 {
             let maximum = atlas
                 .ascii()
                 .iter()

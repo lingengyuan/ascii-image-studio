@@ -6,7 +6,7 @@ use clap::ValueEnum;
 const SIGNAL_EPSILON: f32 = 1.0e-6;
 const TILE_TARGET_PIXELS: u32 = 32;
 const MAX_TILES: u32 = 8;
-const CLIP_LIMIT: f32 = 1.8;
+const CLIP_LIMIT: f32 = 2.0;
 /// 局部均衡与全局拉伸的混合比例。平滑天空和纸张对局部均衡很敏感。
 const CLAHE_STRENGTH: f32 = 0.5;
 const FLAT_BIN_RANGE: u8 = 2;
