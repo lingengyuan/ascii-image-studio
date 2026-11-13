@@ -85,6 +85,28 @@ ASCII 的 `--dither` 只扩散整体密度误差。方向增强与不加 `--dith
 
 盲文展示使用 `--braille --dither`。
 
+## 前后对比
+
+三组图同源同参：`-w 120 -c 1.3 -d 2.5 -e 0.25`，不加 `--dither`，差异只来自色调映射与前景明度。从左到右依次为原图（等比缩放）、基线 HEAD（`d30ea73`，纯白前景）、新版（`51534cf`，CLAHE 0.5 + 前景调制）。三组的新版整体更暗。
+
+### 人像
+
+![人像前后对比](docs/portrait-comparison.png)
+
+暗部字符亮度降低，脸颊和衣服褶皱出现明暗过渡。
+
+### 线稿
+
+![线稿前后对比](docs/lineart-comparison.png)
+
+墨迹亮度跟随纸面亮度，拱券和窗花格的字符方向保留。
+
+### 风景
+
+![风景前后对比](docs/landscape-comparison.png)
+
+树叶和草地的孤立亮点减少，天空渐变更平顺。
+
 ## 参数网格
 
 `scripts/compare-grid.sh` 生成 `--dir-crunch` 与 `--edge-weight` 的 3x3 拼图，并在每格标注实际参数：
@@ -111,4 +133,10 @@ scripts/compare-grid.sh photo.jpg
 
 内嵌字体为 [JetBrains Mono Regular](https://github.com/JetBrains/JetBrainsMono)，按 SIL Open Font License 1.1 使用。许可证见 `assets/OFL.txt`。
 
-展示用风景图：[Backlit Margarita Island Sunset in Las Guevaras, Venezuela](https://commons.wikimedia.org/wiki/File:Backlit_Margarita_Island_Sunset_in_Las_Guevaras,_Venezuela_CaptureNX2.jpg)，作者 Wilfredor，CC0 1.0。
+展示用样本均取自 Wikimedia Commons：
+
+- 人像：[Migrant Mother](https://commons.wikimedia.org/wiki/File:Migrant_Mother_%28LOC_fsa.8b29516%29.jpg)，作者 Dorothea Lange（美国国会图书馆），Public domain，无已知发布限制。
+- 线稿：[Main facade Cathedral of Burgos 1850 Villaamil](https://commons.wikimedia.org/wiki/File:Main_facade_Cathedral_of_Burgos_1850_Villaamil.jpg)，绘图 Genaro Pérez Villaamil；版画 Charles Claude Bachelier；1850，Public domain（PD-old-100、PD-Scan）。
+- 风景：[Backlit Margarita Island Sunset in Las Guevaras, Venezuela](https://commons.wikimedia.org/wiki/File:Backlit_Margarita_Island_Sunset_in_Las_Guevaras,_Venezuela_CaptureNX2.jpg)，作者 Wilfredor，CC0 1.0。
+
+`docs/` 下的对比图由这些样本渲染后拼接，许可同上。
