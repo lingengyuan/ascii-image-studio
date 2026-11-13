@@ -417,9 +417,12 @@ fn foreground_color(
     [level.round().clamp(0.0, 255.0) as u8; 3]
 }
 
+/// 前景亮度曲线的指数。值越小，中间调提亮越多，高光变化越小。
+const FOREGROUND_GAMMA: f32 = 0.70;
+
 /// 黑白模式的前景亮度系数。匹配和渲染必须用同一份，否则中间调仍会偏暗。
 fn foreground_alpha(luminance: f32) -> f32 {
-    0.25 + 0.75 * luminance.clamp(0.0, 1.0).powf(0.85)
+    0.25 + 0.75 * luminance.clamp(0.0, 1.0).powf(FOREGROUND_GAMMA)
 }
 
 /// 把 32D 形状缩放到目标密度并保持结构。零向量没有结构，按均匀覆盖填充。
@@ -689,7 +692,7 @@ mod tests {
     #[test]
     fn mono_foreground_uses_cell_luminance_instead_of_white() {
         let atlas = FontAtlas::load().unwrap();
-        for (value, expected) in [(0_u8, 64_u8), (128, 170), (255, 255)] {
+        for (value, expected) in [(0_u8, 64_u8), (128, 182), (255, 255)] {
             let image =
                 DynamicImage::ImageRgb8(RgbImage::from_pixel(10, 20, Rgb([value, value, value])));
             let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
