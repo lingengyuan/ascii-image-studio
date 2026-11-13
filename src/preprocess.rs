@@ -5,12 +5,19 @@ use crate::tone::{ToneMap, apply as apply_tone_map};
 
 pub const CELL_WIDTH: u32 = 10;
 pub const CELL_HEIGHT: u32 = 20;
-pub const SHAPE_AREA_WEIGHTS: [f32; 6] = [0.15, 0.15, 0.175, 0.175, 0.175, 0.175];
+/// 形状特征按 4x8 子块采样，每块 2.5x2.5 像素，纵向定位比 2x3 精细约 2.7 倍。
+pub const SHAPE_COLS: usize = 4;
+pub const SHAPE_ROWS: usize = 8;
+pub const SHAPE_DIMS: usize = SHAPE_COLS * SHAPE_ROWS;
 
 const BT601_R: f32 = 0.299;
 const BT601_G: f32 = 0.587;
 const BT601_B: f32 = 0.114;
 const SIGNAL_EPSILON: f32 = 1.0e-6;
+const DOG_NARROW_SIGMA: f32 = 0.7;
+const DOG_WIDE_SIGMA: f32 = 1.6;
+/// 有符号 DoG 的固定增益，把锐化强度与 Sobel 方向特征分开。
+const UNSHARP_GAIN: f32 = 1.8;
 
 pub struct ProcessedImage {
     pub width: u32,
@@ -33,22 +40,50 @@ pub struct WorkImage {
     pub edge_strength: Vec<f32>,
 }
 
-pub fn cell_region_bounds(cell_col: u32, cell_row: u32, component: usize) -> (u32, u32, u32, u32) {
-    let sub_col = (component % 2) as u32;
-    let sub_row = (component / 2) as u32;
-    let x0 = cell_col * CELL_WIDTH + sub_col * (CELL_WIDTH / 2);
-    let x1 = x0 + CELL_WIDTH / 2;
-    let y0 = cell_row * CELL_HEIGHT + sub_row * CELL_HEIGHT / 3;
-    let y1 = cell_row * CELL_HEIGHT + (sub_row + 1) * CELL_HEIGHT / 3;
-    (x0, y0, x1, y1)
+/// 子块在单元格内的相对边界，单位是像素，可能落在半像素上。
+pub fn shape_bounds(component: usize) -> (f32, f32, f32, f32) {
+    let sub_col = (component % SHAPE_COLS) as f32;
+    let sub_row = (component / SHAPE_COLS) as f32;
+    let width = CELL_WIDTH as f32 / SHAPE_COLS as f32;
+    let height = CELL_HEIGHT as f32 / SHAPE_ROWS as f32;
+    let x0 = sub_col * width;
+    let y0 = sub_row * height;
+    (x0, y0, x0 + width, y0 + height)
 }
 
-pub fn shape_density(shape: [f32; 6]) -> f32 {
-    shape
-        .into_iter()
-        .zip(SHAPE_AREA_WEIGHTS)
-        .map(|(value, weight)| value * weight)
-        .sum()
+/// 子块面积相等，平均覆盖率就是单元格的整体墨水密度。
+pub fn shape_density(shape: [f32; SHAPE_DIMS]) -> f32 {
+    shape.iter().sum::<f32>() / SHAPE_DIMS as f32
+}
+
+/// 按像素实际覆盖面积加权的区域均值。子块边界落在半像素上，直接取整会偏 0.5 像素。
+pub fn fractional_mean(
+    values: &[f32],
+    width: usize,
+    height: usize,
+    bounds: (f32, f32, f32, f32),
+) -> f32 {
+    let (x0, y0, x1, y1) = bounds;
+    let x_start = x0.floor().max(0.0) as usize;
+    let x_end = (x1.ceil().min(width as f32) as usize).max(x_start);
+    let y_start = y0.floor().max(0.0) as usize;
+    let y_end = (y1.ceil().min(height as f32) as usize).max(y_start);
+
+    let mut sum = 0.0;
+    let mut weight = 0.0;
+    for y in y_start..y_end {
+        let overlap_y = (y as f32 + 1.0).min(y1) - (y as f32).max(y0);
+        for x in x_start..x_end {
+            let overlap_x = (x as f32 + 1.0).min(x1) - (x as f32).max(x0);
+            let area = overlap_x * overlap_y;
+            if area <= 0.0 {
+                continue;
+            }
+            sum += values[y * width + x] * area;
+            weight += area;
+        }
+    }
+    sum / weight.max(f32::EPSILON)
 }
 
 pub fn preprocess(
@@ -91,15 +126,15 @@ pub fn preprocess(
 
     apply_tone_map(&mut luma, width, height, tone_map, contrast)?;
 
-    let (normal_x, normal_y, edge_strength) = if edge_weight > 0.0 {
+    let (normal_x, normal_y, edge_strength, signed_dog) = if edge_weight > 0.0 {
         edge_maps(&luma, width, height)
     } else {
         let zeroes = vec![0.0; pixel_count];
-        (zeroes.clone(), zeroes.clone(), zeroes)
+        (zeroes.clone(), zeroes.clone(), zeroes.clone(), zeroes)
     };
 
     if edge_weight > 0.0 {
-        apply_edge_enhancement(&mut luma, &edge_strength, edge_weight);
+        apply_unsharp_mask(&mut luma, &signed_dog, edge_weight);
     }
 
     Ok(ProcessedImage {
@@ -118,9 +153,9 @@ fn composite_on_black(channel: u8, alpha: u16) -> u8 {
     ((u16::from(channel) * alpha + 127) / 255) as u8
 }
 
-fn edge_maps(luma: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let narrow = gaussian_blur(luma, width, height, 0.8);
-    let wide = gaussian_blur(luma, width, height, 1.6);
+fn edge_maps(luma: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let narrow = gaussian_blur(luma, width, height, DOG_NARROW_SIGMA);
+    let wide = gaussian_blur(luma, width, height, DOG_WIDE_SIGMA);
     let dog: Vec<f32> = narrow
         .iter()
         .zip(wide.iter())
@@ -165,12 +200,15 @@ fn edge_maps(luma: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<f32>, Vec<
         }
     }
 
-    (normal_x, normal_y, magnitudes)
+    (normal_x, normal_y, magnitudes, dog)
 }
 
-fn apply_edge_enhancement(luma: &mut [f32], edges: &[f32], edge_weight: f32) {
-    for (value, edge) in luma.iter_mut().zip(edges.iter()) {
-        *value = (*value + edge_weight * edge).clamp(0.0, 1.0);
+/// 有符号 DoG 非锐化掩模：亮侧更亮、暗侧更暗。
+///
+/// 不能把非负梯度幅值加到亮度上，那会填亮瞳孔、眼线和唇缝。
+fn apply_unsharp_mask(luma: &mut [f32], dog: &[f32], edge_weight: f32) {
+    for (value, dog) in luma.iter_mut().zip(dog.iter()) {
+        *value = (*value + edge_weight * UNSHARP_GAIN * dog).clamp(0.0, 1.0);
     }
 }
 
@@ -374,7 +412,7 @@ mod tests {
 
     use crate::tone::ToneMap;
 
-    use super::{gaussian_blur, preprocess};
+    use super::{apply_unsharp_mask, edge_maps, gaussian_blur, preprocess};
 
     #[test]
     fn bt601_red_and_green_have_expected_luminance() {
@@ -397,6 +435,26 @@ mod tests {
         assert!((processed.display_luma[0] - expected).abs() < 1.0e-6);
         assert!((processed.cell_luminance(1, 1, 0, 0) - expected).abs() < 1.0e-6);
         assert!((processed.luma[0] - expected).abs() > 1.0e-3);
+    }
+
+    #[test]
+    fn signed_unsharp_mask_brightens_light_side_and_darkens_dark_side() {
+        let mut luma = vec![0.2_f32; 9];
+        luma[4] = 0.9;
+        let original = luma.clone();
+        let (_, _, _, dog) = edge_maps(&original, 9, 1);
+        apply_unsharp_mask(&mut luma, &dog, 1.0);
+        assert!(luma[4] >= original[4], "亮侧不应被压暗");
+        assert!(luma[2] < original[2], "暗侧应被压暗");
+        assert!(luma[6] < original[6], "暗侧应被压暗");
+        assert!(
+            luma.iter().all(|value| (0.0..=1.0).contains(value)),
+            "锐化结果必须保持有界"
+        );
+
+        let flat = vec![0.42_f32; 7 * 5];
+        let (_, _, _, flat_dog) = edge_maps(&flat, 7, 5);
+        assert!(flat_dog.iter().all(|value| value.abs() < 1.0e-6));
     }
 
     #[test]

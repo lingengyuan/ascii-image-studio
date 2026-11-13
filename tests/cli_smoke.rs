@@ -391,7 +391,7 @@ fn cli_default_width_is_used_only_for_terminal_output() {
         fs::read_to_string(&file_output)
             .unwrap()
             .lines()
-            .all(|line| line.chars().count() == 120)
+            .all(|line| line.chars().count() == 160)
     );
 
     let narrow_output = temp.path("narrow.txt");
@@ -409,11 +409,11 @@ fn cli_default_width_is_used_only_for_terminal_output() {
             .all(|line| line.chars().count() == 40)
     );
 
-    // 测试进程的 stdout 是管道，不是终端，应退回 120 列。
+    // 测试进程的 stdout 是管道，不是终端，应退回 160 列。
     let terminal = run(&[path_text(&input), "--contrast", "1", "--edge-weight", "0"]);
     assert_success(&terminal);
     let plain = strip_ansi(&String::from_utf8(terminal.stdout).unwrap());
-    assert_eq!(plain.lines().next().unwrap().chars().count(), 120);
+    assert_eq!(plain.lines().next().unwrap().chars().count(), 160);
 }
 
 #[test]
@@ -476,7 +476,7 @@ fn cli_mono_png_uses_cell_luminance_for_foreground() {
             .pixels()
             .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
     );
-    assert_eq!(rendered.pixels().map(|pixel| pixel[0]).max(), Some(160));
+    assert_eq!(rendered.pixels().map(|pixel| pixel[0]).max(), Some(170));
 }
 
 #[test]

@@ -5,7 +5,8 @@ use rayon::prelude::*;
 
 use crate::font_atlas::{BRAILLE_BAYER, BRAILLE_LAYOUT, CharGlyph, FontAtlas, braille_char};
 use crate::preprocess::{
-    CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, shape_density,
+    CELL_HEIGHT, CELL_WIDTH, ProcessedImage, SHAPE_DIMS, WorkImage, fractional_mean, shape_bounds,
+    shape_density,
 };
 
 const DIRECTION_EDGE_THRESHOLD: f32 = 0.55;
@@ -18,6 +19,8 @@ pub struct MatchConfig {
     pub dither: bool,
     pub color: bool,
     pub braille: bool,
+    /// 纯文本没有前景明度调制，匹配时按满亮度覆盖计算。
+    pub plain_text: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -106,7 +109,7 @@ fn match_ascii_parallel(
                         config,
                         work,
                         CellPosition { col, row, rows },
-                        enhanced_samples(work, col, row, config.dir_crunch),
+                        internal_samples(work, col, row),
                     )
                 })
                 .collect()
@@ -129,10 +132,10 @@ fn match_ascii_serial(
     for row in 0..rows {
         for col in 0..config.cols {
             let index = cell_index(config.cols, col, row);
-            // 与无抖动路径同一份方向增强结果；抖动只改密度，不改方向。
-            let enhanced = enhanced_samples(work, col, row, config.dir_crunch);
-            let target_density = (shape_density(enhanced) + errors[index]).clamp(0.0, 1.0);
-            let adjusted = scale_to_density(enhanced, target_density);
+            // 与无抖动路径同一份子块采样；抖动只改密度，不改形状。
+            let samples = internal_samples(work, col, row);
+            let target_density = (shape_density(samples) + errors[index]).clamp(0.0, 1.0);
+            let adjusted = scale_to_density(samples, target_density);
             let cell = build_ascii_cell(
                 image,
                 atlas,
@@ -155,16 +158,23 @@ fn match_ascii_serial(
     cells
 }
 
-/// `enhanced` 已做过方向增强，这里不再 crunch，抖动路径才能与无抖动路径同形。
 fn build_ascii_cell(
     image: &ProcessedImage,
     atlas: &FontAtlas,
     config: &MatchConfig,
     work: &WorkImage,
     position: CellPosition,
-    enhanced: [f32; 6],
+    target: [f32; SHAPE_DIMS],
 ) -> AsciiCell {
-    let mut glyph = nearest_glyph(atlas.ascii(), enhanced);
+    let terms = MatchingTerms::for_cell(
+        image,
+        config,
+        work,
+        position,
+        &target,
+        atlas.density_scale(),
+    );
+    let mut glyph = nearest_glyph(atlas.ascii(), &target, &terms);
 
     if config.edge_weight > 0.0
         && let Some(direction) = edge_direction(work, position.col, position.row)
@@ -180,6 +190,59 @@ fn build_ascii_cell(
         density: shape_density(glyph.shape_vec),
         bitmap: glyph.bitmap.clone(),
     }
+}
+
+/// 匹配时使用的亮度与权重。
+struct MatchingTerms {
+    /// 单元格目标亮度。
+    y_mean: f32,
+    /// 前景颜色亮度系数；渲染出的字形覆盖率为 alpha * shape。
+    alpha: f32,
+    /// 形状距离相对密度误差的权重，边缘处提高、平坦处降低。
+    shape_weight: f32,
+    /// 字形形状密度到 0..1 的缩放，最密字形为 1。
+    density_scale: f32,
+}
+
+impl MatchingTerms {
+    fn for_cell(
+        image: &ProcessedImage,
+        config: &MatchConfig,
+        work: &WorkImage,
+        position: CellPosition,
+        target: &[f32; SHAPE_DIMS],
+        density_scale: f32,
+    ) -> Self {
+        if config.plain_text {
+            let y_mean = target.iter().sum::<f32>() / SHAPE_DIMS as f32;
+            return Self {
+                y_mean,
+                alpha: 1.0,
+                shape_weight: config.dir_crunch * edge_gain(work, position.col, position.row),
+                density_scale,
+            };
+        }
+
+        // 与 renderer 的前景颜色用同一份亮度，匹配结果和实际渲染才不会错位。
+        let y_mean = image.cell_luminance(config.cols, position.rows, position.col, position.row);
+        Self {
+            y_mean,
+            alpha: foreground_alpha(y_mean),
+            shape_weight: config.dir_crunch * edge_gain(work, position.col, position.row),
+            density_scale,
+        }
+    }
+}
+
+/// 形状权重按单元格内最强边缘缩放：强边缘保留结构，平坦皮肤压低结构以抑制噪点。
+fn edge_gain(work: &WorkImage, col: u32, row: u32) -> f32 {
+    let mut peak = 0.0_f32;
+    for y in row * CELL_HEIGHT..(row + 1) * CELL_HEIGHT {
+        for x in col * CELL_WIDTH..(col + 1) * CELL_WIDTH {
+            peak = peak.max(work.edge_strength[y as usize * work.width as usize + x as usize]);
+        }
+    }
+    0.5 + 0.5 * peak.clamp(0.0, 1.0)
 }
 
 fn match_braille(
@@ -237,110 +300,55 @@ fn build_braille_cell(
     }
 }
 
-fn nearest_glyph(glyphs: &[CharGlyph], target: [f32; 6]) -> &CharGlyph {
+fn nearest_glyph<'a>(
+    glyphs: &'a [CharGlyph],
+    target: &[f32; SHAPE_DIMS],
+    terms: &MatchingTerms,
+) -> &'a CharGlyph {
     glyphs
         .iter()
         .min_by(|left, right| {
-            distance_squared(left.shape_vec, target)
-                .total_cmp(&distance_squared(right.shape_vec, target))
+            glyph_cost(left, target, terms).total_cmp(&glyph_cost(right, target, terms))
         })
         .expect("ASCII atlas is not empty")
 }
 
-fn distance_squared(left: [f32; 6], right: [f32; 6]) -> f32 {
-    left.into_iter()
-        .zip(right)
-        .map(|(left, right)| (left - right).powi(2))
-        .sum()
+/// 渲染亮度是 `alpha` 倍的字形覆盖率，按调制后的形状比较才能消除中间调二次压暗。
+fn glyph_cost(glyph: &CharGlyph, target: &[f32; SHAPE_DIMS], terms: &MatchingTerms) -> f32 {
+    let distance: f32 = target
+        .iter()
+        .zip(glyph.shape_vec.iter())
+        .map(|(target, shape)| (*target - terms.alpha * *shape).powi(2))
+        .sum();
+    let density = shape_density(glyph.shape_vec) * terms.density_scale;
+    terms.shape_weight * distance + 1.5 * (terms.y_mean - terms.alpha * density).powi(2)
 }
 
-fn dir_crunch(raw: [f32; 6], external: [f32; 6], exponent: f32) -> [f32; 6] {
+fn internal_samples(work: &WorkImage, col: u32, row: u32) -> [f32; SHAPE_DIMS] {
     std::array::from_fn(|component| {
-        let numerator = raw[component].max(0.0);
-        let denominator = raw[component].max(external[component]).max(0.0);
-        if denominator <= 1.0e-6 {
-            0.0
-        } else {
-            ((numerator / denominator).powf(exponent) * numerator).clamp(0.0, 1.0)
-        }
-    })
-}
-
-/// 方向增强只做一次：无抖动与抖动两条路径都用这个结果选字。
-fn enhanced_samples(work: &WorkImage, col: u32, row: u32, exponent: f32) -> [f32; 6] {
-    dir_crunch(
-        internal_samples(work, col, row),
-        external_samples(work, col, row),
-        exponent,
-    )
-}
-
-fn internal_samples(work: &WorkImage, col: u32, row: u32) -> [f32; 6] {
-    std::array::from_fn(|component| {
-        let bounds = cell_region_bounds(col, row, component);
-        mean_region(work, bounds)
-    })
-}
-
-fn external_samples(work: &WorkImage, col: u32, row: u32) -> [f32; 6] {
-    std::array::from_fn(|component| {
-        let bounds = external_bounds(work, col, row, component);
-        mean_region(work, bounds)
+        let (x0, y0, x1, y1) = shape_bounds(component);
+        let cell_x = (col * CELL_WIDTH) as f32;
+        let cell_y = (row * CELL_HEIGHT) as f32;
+        mean_region(work, (cell_x + x0, cell_y + y0, cell_x + x1, cell_y + y1))
     })
 }
 
 fn braille_samples(work: &WorkImage, col: u32, row: u32) -> [f32; 8] {
     std::array::from_fn(|component| {
         let (dot_row, dot_col) = BRAILLE_LAYOUT[component];
-        let x0 = col * CELL_WIDTH + dot_col as u32 * 5;
-        let y0 = row * CELL_HEIGHT + dot_row as u32 * 5;
-        mean_region(work, (x0, y0, x0 + 5, y0 + 5))
+        let x0 = (col * CELL_WIDTH + dot_col as u32 * 5) as f32;
+        let y0 = (row * CELL_HEIGHT + dot_row as u32 * 5) as f32;
+        mean_region(work, (x0, y0, x0 + 5.0, y0 + 5.0))
     })
 }
 
-fn external_bounds(work: &WorkImage, col: u32, row: u32, component: usize) -> (u32, u32, u32, u32) {
-    let sub_col = (component % 2) as u32;
-    let sub_row = (component / 2) as u32;
-    let cell_x = col * CELL_WIDTH;
-    let cell_y = row * CELL_HEIGHT;
-    let (x0, x1) = if sub_col == 0 {
-        (cell_x as isize - 5, cell_x as isize)
-    } else {
-        (
-            (cell_x + CELL_WIDTH) as isize,
-            (cell_x + CELL_WIDTH + 5) as isize,
-        )
-    };
-    let (y0, y1) = match sub_row {
-        0 => (cell_y as isize - 6, cell_y as isize),
-        1 => ((cell_y + 6) as isize, (cell_y + 13) as isize),
-        _ => (
-            (cell_y + CELL_HEIGHT) as isize,
-            (cell_y + CELL_HEIGHT + 7) as isize,
-        ),
-    };
-    let x0 = x0.clamp(0, work.width as isize) as u32;
-    let x1 = x1.clamp(0, work.width as isize) as u32;
-    let y0 = y0.clamp(0, work.height as isize) as u32;
-    let y1 = y1.clamp(0, work.height as isize) as u32;
-    if x0 < x1 && y0 < y1 {
-        (x0, y0, x1, y1)
-    } else {
-        cell_region_bounds(col, row, component)
-    }
-}
-
-fn mean_region(work: &WorkImage, bounds: (u32, u32, u32, u32)) -> f32 {
-    let (x0, y0, x1, y1) = bounds;
-    let mut sum = 0.0;
-    let mut count = 0_u32;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            sum += work.luma[y as usize * work.width as usize + x as usize];
-            count += 1;
-        }
-    }
-    sum / count.max(1) as f32
+fn mean_region(work: &WorkImage, bounds: (f32, f32, f32, f32)) -> f32 {
+    fractional_mean(
+        &work.luma,
+        work.width as usize,
+        work.height as usize,
+        bounds,
+    )
 }
 
 #[derive(Debug)]
@@ -401,19 +409,24 @@ fn foreground_color(
         return image.cell_highlight_color(config.cols, position.rows, position.col, position.row);
     }
     let luminance = image.cell_luminance(config.cols, position.rows, position.col, position.row);
-    let level = (0.25 + 0.75 * luminance.clamp(0.0, 1.0)) * 255.0;
+    let level = foreground_alpha(luminance) * 255.0;
     [level.round().clamp(0.0, 255.0) as u8; 3]
 }
 
-/// 把 6D 形状缩放到目标密度并保持方向。零向量没有方向，按面积权重均分。
+/// 黑白模式的前景亮度系数。匹配和渲染必须用同一份，否则中间调仍会偏暗。
+fn foreground_alpha(luminance: f32) -> f32 {
+    0.25 + 0.75 * luminance.clamp(0.0, 1.0).powf(0.85)
+}
+
+/// 把 32D 形状缩放到目标密度并保持结构。零向量没有结构，按均匀覆盖填充。
 ///
 /// 缩放只有一个比例，所以分量之间的比值不变。有分量碰到 1.0 时整体停止放大，
-/// 达不到的密度留给调用方当标量残差扩散；逐分量截断会改变方向，不能这么做。
-fn scale_to_density(shape: [f32; 6], target_density: f32) -> [f32; 6] {
+/// 达不到的密度留给调用方当标量残差扩散；逐分量截断会改变结构，不能这么做。
+fn scale_to_density(shape: [f32; SHAPE_DIMS], target_density: f32) -> [f32; SHAPE_DIMS] {
     let target = target_density.clamp(0.0, 1.0);
     let current = shape_density(shape);
     if current <= 1.0e-6 {
-        return [target; 6];
+        return [target; SHAPE_DIMS];
     }
     let peak = shape.into_iter().fold(0.0_f32, f32::max);
     let mut scale = target / current;
@@ -454,15 +467,11 @@ mod tests {
     use image::{DynamicImage, Rgb, RgbImage};
 
     use super::{
-        CellPosition, MatchConfig, build_ascii_cell, diffuse_scalar_error, dir_crunch,
-        directional_ascii, distance_squared, enhanced_samples, external_bounds, external_samples,
-        internal_samples, match_image, mean_region, output_rows, scale_to_density,
+        MatchConfig, MatchedArt, directional_ascii, internal_samples, match_image, mean_region,
+        scale_to_density,
     };
     use crate::font_atlas::FontAtlas;
-    use crate::preprocess::{
-        CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, preprocess,
-        shape_density,
-    };
+    use crate::preprocess::{SHAPE_DIMS, WorkImage, preprocess, shape_bounds, shape_density};
     use crate::tone::ToneMap;
 
     fn gradient_image(width: u32, height: u32) -> DynamicImage {
@@ -479,69 +488,25 @@ mod tests {
     fn config(dither: bool) -> MatchConfig {
         MatchConfig {
             cols: 16,
-            dir_crunch: 2.5,
+            dir_crunch: 1.4,
             edge_weight: 0.25,
             dither,
             color: false,
             braille: false,
+            plain_text: true,
         }
     }
 
-    /// 亮暗竖条对齐单元边界：右邻域比内部亮、左邻域更暗，外部样本逐分量不均匀。
-    fn striped_image(width: u32, height: u32) -> DynamicImage {
-        let mut image = RgbImage::new(width, height);
-        for y in 0..height {
-            let base = 0.35 + 0.3 * y as f32 / height as f32;
-            for x in 0..width {
-                let level = if x % CELL_WIDTH < CELL_WIDTH / 2 {
-                    0.9
-                } else {
-                    0.1
-                };
-                let value = (level * base * 255.0).round() as u8;
-                image.put_pixel(x, y, Rgb([value, value, value]));
-            }
+    fn work_image(width: u32, height: u32, luma: Vec<f32>) -> WorkImage {
+        let zeros = vec![0.0; luma.len()];
+        WorkImage {
+            width,
+            height,
+            luma,
+            normal_x: zeros.clone(),
+            normal_y: zeros.clone(),
+            edge_strength: zeros,
         }
-        DynamicImage::ImageRgb8(image)
-    }
-
-    /// 只按顺序拼装现有元件：先 crunch，再等比缩放模长，最后选字。
-    fn reference_serial_chars(
-        image: &ProcessedImage,
-        atlas: &FontAtlas,
-        config: &MatchConfig,
-    ) -> Vec<char> {
-        let rows = output_rows(config.cols, image.width, image.height).unwrap();
-        let work = image
-            .resample(config.cols * CELL_WIDTH, rows * CELL_HEIGHT)
-            .unwrap();
-        let mut errors = vec![0.0_f32; (config.cols * rows) as usize];
-        let mut chars = Vec::new();
-        for row in 0..rows {
-            for col in 0..config.cols {
-                let index = (row * config.cols + col) as usize;
-                let enhanced = enhanced_samples(&work, col, row, config.dir_crunch);
-                let target = (shape_density(enhanced) + errors[index]).clamp(0.0, 1.0);
-                let cell = build_ascii_cell(
-                    image,
-                    atlas,
-                    config,
-                    &work,
-                    CellPosition { col, row, rows },
-                    scale_to_density(enhanced, target),
-                );
-                diffuse_scalar_error(
-                    config.cols,
-                    rows,
-                    col,
-                    row,
-                    target - cell.density,
-                    &mut errors,
-                );
-                chars.push(cell.ch);
-            }
-        }
-        chars
     }
 
     #[test]
@@ -566,53 +531,35 @@ mod tests {
     }
 
     #[test]
-    fn external_samples_use_regions_touching_the_cell_edge() {
-        let mut work = WorkImage {
-            width: 30,
-            height: 40,
-            luma: vec![0.0; 30 * 40],
-            normal_x: vec![0.0; 30 * 40],
-            normal_y: vec![0.0; 30 * 40],
-            edge_strength: vec![0.0; 30 * 40],
-        };
-        for y in 6..13 {
-            for x in 10..15 {
-                work.luma[y * work.width as usize + x] = 0.8;
+    fn shape_bounds_split_cell_into_four_by_eight_blocks() {
+        assert_eq!(shape_bounds(0), (0.0, 0.0, 2.5, 2.5));
+        assert_eq!(shape_bounds(3), (7.5, 0.0, 10.0, 2.5));
+        assert_eq!(shape_bounds(SHAPE_DIMS - 1), (7.5, 17.5, 10.0, 20.0));
+    }
+
+    #[test]
+    fn internal_samples_resolve_half_pixel_vertical_positions() {
+        // 上半亮、下半暗：8 行子块应逐行分档，旧的 2x3 网格只有 3 档。
+        let mut luma = vec![0.0_f32; 10 * 20];
+        for y in 0..20 {
+            for x in 0..10 {
+                luma[y * 10 + x] = if y < 10 { 0.9 } else { 0.1 };
             }
         }
-        let bounds = external_bounds(&work, 0, 0, 3);
-        assert_eq!(bounds, (10, 6, 15, 13));
-        assert!((mean_region(&work, bounds) - 0.8).abs() < 1.0e-6);
-
-        let edge_work = WorkImage {
-            width: 10,
-            height: 20,
-            luma: vec![0.3; 10 * 20],
-            normal_x: vec![0.0; 10 * 20],
-            normal_y: vec![0.0; 10 * 20],
-            edge_strength: vec![0.0; 10 * 20],
-        };
-        assert_eq!(
-            external_bounds(&edge_work, 0, 0, 0),
-            cell_region_bounds(0, 0, 0)
-        );
+        let work = work_image(10, 20, luma);
+        let samples = internal_samples(&work, 0, 0);
+        for row in 0..8 {
+            let mean = (0..4).map(|col| samples[row * 4 + col]).sum::<f32>() / 4.0;
+            let expected = if row < 4 { 0.9 } else { 0.1 };
+            assert!((mean - expected).abs() < 1.0e-5, "row={row} mean={mean}");
+        }
     }
 
     #[test]
-    fn external_brightness_suppresses_only_the_matching_direction() {
-        let raw = [0.2; 6];
-        let mut external = [0.0; 6];
-        external[3] = 0.8;
-        let enhanced = dir_crunch(raw, external, 2.5);
-        assert!(enhanced[3] < enhanced[2]);
-        assert!((enhanced[2] - 0.2).abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn six_dimensional_distance_uses_same_normalized_units() {
-        let left = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
-        let right = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
-        assert_eq!(distance_squared(left, right), 0.0);
+    fn fractional_mean_weights_partial_pixels() {
+        let work = work_image(2, 1, vec![0.0, 1.0]);
+        let mean = mean_region(&work, (0.0, 0.0, 1.5, 1.0));
+        assert!((mean - 1.0 / 3.0).abs() < 1.0e-6, "mean={mean}");
     }
 
     #[test]
@@ -671,18 +618,20 @@ mod tests {
 
     #[test]
     fn density_scaling_keeps_direction_and_handles_zero_and_saturation() {
-        let raw = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let raw: [f32; SHAPE_DIMS] = std::array::from_fn(|index| 0.1 + 0.02 * index as f32);
         let scaled = scale_to_density(raw, 0.3);
         assert!((shape_density(scaled) - 0.3).abs() < 1.0e-6);
-        for component in 1..6 {
+        for component in 1..SHAPE_DIMS {
             assert!((scaled[component] / scaled[0] - raw[component] / raw[0]).abs() < 1.0e-6);
         }
 
-        let zero = scale_to_density([0.0; 6], 0.25);
-        assert_eq!(zero, [0.25; 6]);
+        let zero = scale_to_density([0.0; SHAPE_DIMS], 0.25);
+        assert_eq!(zero, [0.25; SHAPE_DIMS]);
         assert!((shape_density(zero) - 0.25).abs() < 1.0e-6);
 
-        let saturated = scale_to_density([0.9, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0);
+        let mut saturated_raw = [0.0; SHAPE_DIMS];
+        saturated_raw[0] = 0.9;
+        let saturated = scale_to_density(saturated_raw, 1.0);
         assert_eq!(saturated[0], 1.0);
         assert!(
             saturated
@@ -693,7 +642,7 @@ mod tests {
 
     #[test]
     fn saturation_scales_every_component_by_one_factor() {
-        let raw = [0.75, 0.5, 0.25, 0.2, 0.1, 0.05];
+        let raw: [f32; SHAPE_DIMS] = std::array::from_fn(|index| 0.75 - 0.02 * index as f32);
         let scaled = scale_to_density(raw, 1.0);
         let cap = 1.0 / raw[0];
         for (value, source) in scaled.into_iter().zip(raw) {
@@ -707,61 +656,28 @@ mod tests {
     }
 
     #[test]
-    fn scaling_before_crunch_would_move_the_suppressed_direction() {
-        let raw = [0.3, 0.06, 0.3, 0.06, 0.3, 0.06];
-        let external = [0.0, 0.3, 0.0, 0.3, 0.0, 0.3];
-        let enhanced = dir_crunch(raw, external, 2.5);
-        let scaled = scale_to_density(enhanced, 0.35);
-        for component in 1..6 {
-            let ratio = scaled[component] / scaled[0];
-            let reference = enhanced[component] / enhanced[0];
-            assert!((ratio - reference).abs() < 1.0e-6, "ratio={ratio}");
-        }
-
-        let reordered = dir_crunch(scale_to_density(raw, 0.35), external, 2.5);
-        let reordered_ratio = reordered[1] / reordered[0];
-        let kept_ratio = scaled[1] / scaled[0];
-        assert!(
-            reordered_ratio > 2.0 * kept_ratio,
-            "先缩放再 crunch 会降低外部抑制：{reordered_ratio} vs {kept_ratio}"
-        );
-    }
-
-    #[test]
-    fn dither_rescales_the_crunched_shape_on_uneven_external_neighborhoods() {
-        let image = striped_image(40, 40);
+    fn modulated_matching_compensates_for_foreground_brightness() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 40, Rgb([128, 128, 128])));
         let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
         let atlas = FontAtlas::load().unwrap();
-        let mut conf = config(true);
-        conf.edge_weight = 0.0;
+        let mut modulated = config(false);
+        modulated.plain_text = false;
 
-        // 前置条件：确实有分量碰上了更亮的相邻外部，dir_crunch 的阈值会介入。
-        let rows = output_rows(conf.cols, processed.width, processed.height).unwrap();
-        let work = processed
-            .resample(conf.cols * CELL_WIDTH, rows * CELL_HEIGHT)
-            .unwrap();
-        let suppressed: usize = (0..rows)
-            .flat_map(|row| (0..conf.cols).map(move |col| (col, row)))
-            .map(|(col, row)| {
-                let raw = internal_samples(&work, col, row);
-                let external = external_samples(&work, col, row);
-                raw.into_iter()
-                    .zip(external)
-                    .filter(|(inside, outside)| outside > inside)
-                    .count()
-            })
-            .sum();
-        assert!(suppressed > 0, "样本没有跨过外部阈值，测不到顺序差异");
-
-        let art = match_image(&processed, &atlas, &conf).unwrap();
-        let actual: Vec<char> = art.cells.iter().map(|cell| cell.ch).collect();
-        assert_eq!(actual, reference_serial_chars(&processed, &atlas, &conf));
+        let mean_density = |art: &MatchedArt| {
+            art.cells.iter().map(|cell| cell.density).sum::<f32>() / art.cells.len() as f32
+        };
+        let modulated_density = mean_density(&match_image(&processed, &atlas, &modulated).unwrap());
+        let plain_density = mean_density(&match_image(&processed, &atlas, &config(false)).unwrap());
+        assert!(
+            modulated_density > plain_density + 0.05,
+            "modulated={modulated_density}, plain={plain_density}"
+        );
     }
 
     #[test]
     fn mono_foreground_uses_cell_luminance_instead_of_white() {
         let atlas = FontAtlas::load().unwrap();
-        for (value, expected) in [(0_u8, 64_u8), (128, 160), (255, 255)] {
+        for (value, expected) in [(0_u8, 64_u8), (128, 170), (255, 255)] {
             let image =
                 DynamicImage::ImageRgb8(RgbImage::from_pixel(10, 20, Rgb([value, value, value])));
             let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
