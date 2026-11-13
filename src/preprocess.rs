@@ -5,7 +5,7 @@ use crate::tone::{ToneMap, apply as apply_tone_map};
 
 pub const CELL_WIDTH: u32 = 10;
 pub const CELL_HEIGHT: u32 = 20;
-/// 形状特征按 4x8 子块采样，每块 2.5x2.5 像素，纵向定位比 2x3 精细约 2.7 倍。
+/// 形状特征按 4x8 子块采样，每块 2.5x2.5 像素。
 pub const SHAPE_COLS: usize = 4;
 pub const SHAPE_ROWS: usize = 8;
 pub const SHAPE_DIMS: usize = SHAPE_COLS * SHAPE_ROWS;

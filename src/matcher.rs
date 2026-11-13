@@ -213,12 +213,12 @@ impl MatchingTerms {
         target: &[f32; SHAPE_DIMS],
         density_scale: f32,
     ) -> Self {
+        let shape_weight = config.dir_crunch * edge_gain(work, position.col, position.row);
         if config.plain_text {
-            let y_mean = target.iter().sum::<f32>() / SHAPE_DIMS as f32;
             return Self {
-                y_mean,
+                y_mean: target.iter().sum::<f32>() / SHAPE_DIMS as f32,
                 alpha: 1.0,
-                shape_weight: config.dir_crunch * edge_gain(work, position.col, position.row),
+                shape_weight,
                 density_scale,
             };
         }
@@ -228,13 +228,13 @@ impl MatchingTerms {
         Self {
             y_mean,
             alpha: foreground_alpha(y_mean),
-            shape_weight: config.dir_crunch * edge_gain(work, position.col, position.row),
+            shape_weight,
             density_scale,
         }
     }
 }
 
-/// 形状权重按单元格内最强边缘缩放：强边缘保留结构，平坦皮肤压低结构以抑制噪点。
+/// 形状权重按单元格内最强边缘缩放：强边缘保留结构，平坦区域压低结构以抑制噪点。
 fn edge_gain(work: &WorkImage, col: u32, row: u32) -> f32 {
     let mut peak = 0.0_f32;
     for y in row * CELL_HEIGHT..(row + 1) * CELL_HEIGHT {
@@ -314,10 +314,7 @@ fn nearest_glyph<'a>(
 }
 
 /// 形状按原始覆盖率比较，亮度由密度项按 `alpha` 补偿。
-///
-/// 在形状距离里再乘 `alpha` 会抬高中间调的目标覆盖率，平坦区域全部选中最密的字形，
-/// 五官轮廓被高密度纹理淹没。去掉这层调制后，轮廓仍由线条字符表达，
-/// 中间调变暗的问题由密度正则项负责修正。
+/// 在距离里再乘 `alpha` 会抬高中间调目标覆盖率，平坦区域全部选中最密的字形。
 fn glyph_cost(glyph: &CharGlyph, target: &[f32; SHAPE_DIMS], terms: &MatchingTerms) -> f32 {
     let distance: f32 = target
         .iter()
@@ -329,10 +326,10 @@ fn glyph_cost(glyph: &CharGlyph, target: &[f32; SHAPE_DIMS], terms: &MatchingTer
 }
 
 fn internal_samples(work: &WorkImage, col: u32, row: u32) -> [f32; SHAPE_DIMS] {
+    let cell_x = (col * CELL_WIDTH) as f32;
+    let cell_y = (row * CELL_HEIGHT) as f32;
     std::array::from_fn(|component| {
         let (x0, y0, x1, y1) = shape_bounds(component);
-        let cell_x = (col * CELL_WIDTH) as f32;
-        let cell_y = (row * CELL_HEIGHT) as f32;
         mean_region(work, (cell_x + x0, cell_y + y0, cell_x + x1, cell_y + y1))
     })
 }
@@ -546,7 +543,7 @@ mod tests {
 
     #[test]
     fn internal_samples_resolve_half_pixel_vertical_positions() {
-        // 上半亮、下半暗：8 行子块应逐行分档，旧的 2x3 网格只有 3 档。
+        // 上半亮、下半暗：8 行子块应逐行分档。
         let mut luma = vec![0.0_f32; 10 * 20];
         for y in 0..20 {
             for x in 0..10 {
@@ -624,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn density_scaling_keeps_direction_and_handles_zero_and_saturation() {
+    fn density_scaling_keeps_structure_and_handles_zero_and_saturation() {
         let raw: [f32; SHAPE_DIMS] = std::array::from_fn(|index| 0.1 + 0.02 * index as f32);
         let scaled = scale_to_density(raw, 0.3);
         assert!((shape_density(scaled) - 0.3).abs() < 1.0e-6);

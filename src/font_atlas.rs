@@ -21,7 +21,7 @@ pub struct CharGlyph {
 pub struct FontAtlas {
     ascii: Vec<CharGlyph>,
     braille_bitmaps: Vec<Arc<[u8]>>,
-    /// 把归一化形状向量的平均密度缩放到 0..1，最密的字形为 1。
+    /// 归一化形状密度的倒数，最密字形映射为 1。
     density_scale: f32,
 }
 
@@ -164,8 +164,7 @@ fn raw_shape_vector(bitmap: &[u8]) -> [f32; SHAPE_DIMS] {
     })
 }
 
-/// 逐维归一到字体能达到的最大覆盖率。匹配按归一化形状比较，
-/// 亮度由 `alpha` 和密度正则项承担，二者单位才一致。
+/// 逐维归一到字体能达到的最大覆盖率，让不同字形在同一尺度上比较。
 fn normalize_shape_vectors(glyphs: &mut [CharGlyph]) {
     let mut maxima = [0.0_f32; SHAPE_DIMS];
     for glyph in glyphs.iter() {

@@ -33,7 +33,7 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "clahe")]
     pub tone_map: ToneMap,
 
-    /// 形状向量相对亮度密度的权重；强边缘处提高，平坦皮肤处降低
+    /// 形状向量相对亮度密度的权重；强边缘提高，平坦区域降低
     #[arg(short = 'd', long, default_value_t = 1.4, value_parser = positive_finite_f32)]
     pub dir_crunch: f32,
 
