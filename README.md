@@ -2,6 +2,10 @@
 
 将图片转换为黑底、等宽字符画。字符按字体的 32 维（4x8 子块）形状向量匹配，并用有符号 DoG 锐化和 Sobel 方向特征保留轮廓。
 
+## 环境要求
+
+Rust 1.85 或更高版本（edition 2024）。
+
 ## 构建与使用
 
 ```bash
@@ -55,13 +59,13 @@ cargo build --release
 | --- | --- | --- | --- |
 | ![原图](docs/landscape-original.jpg) | ![标准 ASCII](docs/landscape-ascii.png) | ![彩色](docs/landscape-color.png) | ![盲文](docs/landscape-braille.png) |
 
-盲文示例使用 `--braille --dither`。
+彩色示例使用 `--color`，盲文示例使用 `--braille --dither`。
 
 ## 开发
 
 `scripts/compare-grid.sh photo.jpg` 生成 `--dir-crunch` 与 `--edge-weight` 的 3x3 拼图，输出 `output/compare/<图片名>/grid.png`。拼图需要 Python 3 与 Pillow，仅用于开发比较。
 
-CI 在推送和拉取请求时运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features`，并构建 Linux x86_64、macOS arm64、macOS x86_64、Windows x86_64 四个平台的二进制。工作流尚未在 GitHub 云端执行。
+CI 在推送和拉取请求时运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features`，并构建 Linux x86_64、macOS arm64、macOS x86_64、Windows x86_64 四个平台的二进制。工作流定义见 `.github/workflows/ci.yml`。
 
 ## 许可
 

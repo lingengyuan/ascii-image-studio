@@ -60,7 +60,7 @@ sheet = Image.new(
 draw = ImageDraw.Draw(sheet)
 draw.text(
     (gap, 8),
-    f"{Path(source).name} · width=80 · default contrast=1.3 / clahe",
+    f"{Path(source).name} · width=80 · default contrast=1.1 / clahe",
     fill=(235, 235, 235),
     font=font,
 )
