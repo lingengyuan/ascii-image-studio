@@ -16,6 +16,8 @@ cargo build --release
 ./target/release/ascii-image-studio photo.jpg
 ```
 
+终端输出未指定 `--width` 时按窗口列数取宽；输出文件或重定向时默认 120 列。
+
 ```bash
 ./target/release/ascii-image-studio photo.jpg --width 100 --color
 ```
@@ -25,20 +27,44 @@ cargo build --release
 ```
 
 ```bash
-./target/release/ascii-image-studio photo.jpg --braille --output portrait.png
+./target/release/ascii-image-studio photo.jpg --braille --dither --output portrait.png
 ```
-
-不传 `--output` 时输出到终端。常用参数：
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `-w, --width` | `120` | 输出字符列数 |
-| `-c, --contrast` | `1.3` | 全局对比度幂指数 |
+| `-w, --width` | 终端宽度 / 120 | 输出字符列数；显式值优先 |
+| `-o, --output` | 终端 | 输出文件；扩展名决定格式 |
+| `-c, --contrast` | `1.3` | 对比度幂指数，作用于色调映射后的亮度 |
+| `--tone-map` | `clahe` | `clahe` 局部均衡；`global` 全局 1%–99% 拉伸（旧版色调曲线） |
 | `-d, --dir-crunch` | `2.5` | 外部邻域方向锐化指数 |
-| `-e, --edge-weight` | `0.25` | 边缘增强权重，范围为 0 到 1 |
-| `--dither` | 关闭 | 使用 Floyd-Steinberg 误差扩散 |
-| `--color` | 关闭 | 保留高亮区域颜色 |
-| `--braille` | 关闭 | 使用 2x4 盲文点阵匹配 |
+| `-e, --edge-weight` | `0.25` | DoG 与 Sobel 边缘权重；0 表示关闭 |
+| `--dither` | 关闭 | ASCII 用 Floyd–Steinberg；盲文用 2x4 Bayer 有序抖动 |
+| `--color` | 关闭 | 保留原图高亮区域颜色 |
+| `--braille` | 关闭 | 使用 2x4 盲文点阵字符 |
+
+## 色调映射
+
+`--tone-map clahe`（默认）把亮度分成最多 8x8 块，逐块限幅并重分配直方图，再用双线性插值消除块边界。纯色块保持原值。局部结果与全局拉伸各占一半，以压低平滑天空和纸张上的噪点。
+
+`--tone-map global` 保留旧版色调曲线：全局 1%–99% 拉伸，再乘对比度幂指数。低对比或噪点明显的图片可改用它。
+
+`--contrast` 在色调映射之后生效，两种模式的语义相同。
+
+## 前景明度
+
+黑白输出按单元真实亮度调制前景：
+
+```text
+I_fg = 0.25 + 0.75 * Y_cell
+```
+
+`Y_cell` 是单元内合成到黑底后的平均亮度，不经过 CLAHE、拉伸或边缘增强。暗处字符因此不会保持纯白。`--color` 保留真实 RGB，不做这层调制。`.txt` 只有字符，没有色调。
+
+## 抖动
+
+ASCII 的 `--dither` 只扩散整体密度误差。方向增强与不加 `--dither` 时同一步、只做一次；选字前把增强后的 6D 形状按一个比例缩放到目标密度，分量比值不变。有分量到 1.0 时整体停止放大，达不到的密度作为残差继续扩散。零向量没有方向，按面积均分。
+
+盲文使用标准 Unicode 点位，2x4 点阵对应关系为 `[[0,3],[1,4],[2,5],[6,7]]`。`--braille --dither` 使用 2x4 Bayer 有序抖动；不加 `--dither` 时按 0.5 阈值二值化。盲文没有字形方向选择，`--dir-crunch` 只影响 ASCII 字符匹配。
 
 ## 输出
 
@@ -49,6 +75,40 @@ cargo build --release
 
 透明像素先合成到黑底。盲文 PNG 使用标准 2x4 点阵位图绘制，不依赖字体盲文字形。
 
-## 字体许可
+## 展示
+
+样本为逆光风景（CC0，见下方许可）。四张图使用同一输入，`-w 80`。
+
+| 原图 | 标准 ASCII | 彩色 | 盲文 |
+| --- | --- | --- | --- |
+| ![原图](docs/landscape-original.jpg) | ![标准 ASCII](docs/landscape-ascii.png) | ![彩色](docs/landscape-color.png) | ![盲文](docs/landscape-braille.png) |
+
+盲文展示使用 `--braille --dither`。
+
+## 参数网格
+
+`scripts/compare-grid.sh` 生成 `--dir-crunch` 与 `--edge-weight` 的 3x3 拼图，并在每格标注实际参数：
+
+```bash
+cargo build --release
+scripts/compare-grid.sh photo.jpg
+```
+
+输出在 `output/compare/<图片名>/grid.png`。拼图步骤需要 Python 3 和 Pillow，仅用于开发比较，不是运行时依赖。
+
+## CI
+
+`.github/workflows/ci.yml` 在推送和拉取请求时执行：
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- 构建 Linux x86_64、macOS arm64、macOS x86_64、Windows x86_64 四个 target，并上传二进制 artifact。
+
+工作流只在本地做过静态检查，尚未在 GitHub 云端执行。
+
+## 许可
 
 内嵌字体为 [JetBrains Mono Regular](https://github.com/JetBrains/JetBrainsMono)，按 SIL Open Font License 1.1 使用。许可证见 `assets/OFL.txt`。
+
+展示用风景图：[Backlit Margarita Island Sunset in Las Guevaras, Venezuela](https://commons.wikimedia.org/wiki/File:Backlit_Margarita_Island_Sunset_in_Las_Guevaras,_Venezuela_CaptureNX2.jpg)，作者 Wilfredor，CC0 1.0。

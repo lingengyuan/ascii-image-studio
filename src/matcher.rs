@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Result, ensure};
 use rayon::prelude::*;
 
-use crate::font_atlas::{BRAILLE_LAYOUT, CharGlyph, FontAtlas, braille_char};
+use crate::font_atlas::{BRAILLE_BAYER, BRAILLE_LAYOUT, CharGlyph, FontAtlas, braille_char};
 use crate::preprocess::{
     CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, shape_density,
 };
@@ -64,7 +64,7 @@ pub fn match_image(
         .map_err(|_| anyhow::anyhow!("字符网格尺寸溢出"))?;
     let work = image.resample(width, height)?;
     let cells = if config.braille {
-        match_braille(image, atlas, config, &work, rows, cell_count)
+        match_braille(image, atlas, config, &work, rows)
     } else if config.dither {
         match_ascii_serial(image, atlas, config, &work, rows, cell_count)
     } else {
@@ -100,14 +100,13 @@ fn match_ascii_parallel(
         .map(|row| {
             (0..config.cols)
                 .map(|col| {
-                    let raw = internal_samples(work, col, row);
                     build_ascii_cell(
                         image,
                         atlas,
                         config,
                         work,
                         CellPosition { col, row, rows },
-                        raw,
+                        enhanced_samples(work, col, row, config.dir_crunch),
                     )
                 })
                 .collect()
@@ -130,10 +129,10 @@ fn match_ascii_serial(
     for row in 0..rows {
         for col in 0..config.cols {
             let index = cell_index(config.cols, col, row);
-            let raw = internal_samples(work, col, row);
-            let adjusted =
-                std::array::from_fn(|component| (raw[component] + errors[index]).clamp(0.0, 1.0));
-            let target_density = shape_density(adjusted);
+            // 与无抖动路径同一份方向增强结果；抖动只改密度，不改方向。
+            let enhanced = enhanced_samples(work, col, row, config.dir_crunch);
+            let target_density = (shape_density(enhanced) + errors[index]).clamp(0.0, 1.0);
+            let adjusted = scale_to_density(enhanced, target_density);
             let cell = build_ascii_cell(
                 image,
                 atlas,
@@ -156,16 +155,15 @@ fn match_ascii_serial(
     cells
 }
 
+/// `enhanced` 已做过方向增强，这里不再 crunch，抖动路径才能与无抖动路径同形。
 fn build_ascii_cell(
     image: &ProcessedImage,
     atlas: &FontAtlas,
     config: &MatchConfig,
     work: &WorkImage,
     position: CellPosition,
-    raw: [f32; 6],
+    enhanced: [f32; 6],
 ) -> AsciiCell {
-    let external = external_samples(work, position.col, position.row);
-    let enhanced = dir_crunch(raw, external, config.dir_crunch);
     let mut glyph = nearest_glyph(atlas.ascii(), enhanced);
 
     if config.edge_weight > 0.0
@@ -190,56 +188,25 @@ fn match_braille(
     config: &MatchConfig,
     work: &WorkImage,
     rows: u32,
-    cell_count: usize,
 ) -> Vec<AsciiCell> {
-    if !config.dither {
-        let rows_of_cells: Vec<Vec<AsciiCell>> = (0..rows)
-            .into_par_iter()
-            .map(|row| {
-                (0..config.cols)
-                    .map(|col| {
-                        let samples = braille_samples(work, col, row);
-                        build_braille_cell(
-                            image,
-                            atlas,
-                            config,
-                            CellPosition { col, row, rows },
-                            samples,
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
-        return rows_of_cells.into_iter().flatten().collect();
-    }
-
-    let mut cells = Vec::with_capacity(cell_count);
-    let mut errors = vec![0.0_f32; cell_count];
-    for row in 0..rows {
-        for col in 0..config.cols {
-            let index = cell_index(config.cols, col, row);
-            let samples = braille_samples(work, col, row);
-            let adjusted = samples.map(|sample| (sample + errors[index]).clamp(0.0, 1.0));
-            let target_density = adjusted.iter().sum::<f32>() / 8.0;
-            let cell = build_braille_cell(
-                image,
-                atlas,
-                config,
-                CellPosition { col, row, rows },
-                adjusted,
-            );
-            diffuse_scalar_error(
-                config.cols,
-                rows,
-                col,
-                row,
-                target_density - cell.density,
-                &mut errors,
-            );
-            cells.push(cell);
-        }
-    }
-    cells
+    let rows_of_cells: Vec<Vec<AsciiCell>> = (0..rows)
+        .into_par_iter()
+        .map(|row| {
+            (0..config.cols)
+                .map(|col| {
+                    build_braille_cell(
+                        image,
+                        atlas,
+                        config,
+                        CellPosition { col, row, rows },
+                        braille_samples(work, col, row),
+                        config.dither,
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    rows_of_cells.into_iter().flatten().collect()
 }
 
 fn build_braille_cell(
@@ -248,10 +215,17 @@ fn build_braille_cell(
     config: &MatchConfig,
     position: CellPosition,
     samples: [f32; 8],
+    ordered_dither: bool,
 ) -> AsciiCell {
     let mut bits = 0_u8;
     for (bit, sample) in samples.into_iter().enumerate() {
-        if sample >= 0.5 {
+        let threshold = if ordered_dither {
+            let (dot_row, dot_col) = BRAILLE_LAYOUT[bit];
+            (f32::from(BRAILLE_BAYER[dot_row][dot_col]) + 0.5) / 8.0
+        } else {
+            0.5
+        };
+        if sample >= threshold {
             bits |= 1 << bit;
         }
     }
@@ -290,6 +264,15 @@ fn dir_crunch(raw: [f32; 6], external: [f32; 6], exponent: f32) -> [f32; 6] {
             ((numerator / denominator).powf(exponent) * numerator).clamp(0.0, 1.0)
         }
     })
+}
+
+/// 方向增强只做一次：无抖动与抖动两条路径都用这个结果选字。
+fn enhanced_samples(work: &WorkImage, col: u32, row: u32, exponent: f32) -> [f32; 6] {
+    dir_crunch(
+        internal_samples(work, col, row),
+        external_samples(work, col, row),
+        exponent,
+    )
 }
 
 fn internal_samples(work: &WorkImage, col: u32, row: u32) -> [f32; 6] {
@@ -415,10 +398,29 @@ fn foreground_color(
     position: CellPosition,
 ) -> [u8; 3] {
     if config.color {
-        image.cell_highlight_color(config.cols, position.rows, position.col, position.row)
-    } else {
-        [255, 255, 255]
+        return image.cell_highlight_color(config.cols, position.rows, position.col, position.row);
     }
+    let luminance = image.cell_luminance(config.cols, position.rows, position.col, position.row);
+    let level = (0.25 + 0.75 * luminance.clamp(0.0, 1.0)) * 255.0;
+    [level.round().clamp(0.0, 255.0) as u8; 3]
+}
+
+/// 把 6D 形状缩放到目标密度并保持方向。零向量没有方向，按面积权重均分。
+///
+/// 缩放只有一个比例，所以分量之间的比值不变。有分量碰到 1.0 时整体停止放大，
+/// 达不到的密度留给调用方当标量残差扩散；逐分量截断会改变方向，不能这么做。
+fn scale_to_density(shape: [f32; 6], target_density: f32) -> [f32; 6] {
+    let target = target_density.clamp(0.0, 1.0);
+    let current = shape_density(shape);
+    if current <= 1.0e-6 {
+        return [target; 6];
+    }
+    let peak = shape.into_iter().fold(0.0_f32, f32::max);
+    let mut scale = target / current;
+    if peak > 1.0e-6 {
+        scale = scale.min(1.0 / peak);
+    }
+    shape.map(|value| value * scale)
 }
 
 #[derive(Clone, Copy)]
@@ -452,11 +454,16 @@ mod tests {
     use image::{DynamicImage, Rgb, RgbImage};
 
     use super::{
-        MatchConfig, dir_crunch, directional_ascii, distance_squared, external_bounds, match_image,
-        mean_region,
+        CellPosition, MatchConfig, build_ascii_cell, diffuse_scalar_error, dir_crunch,
+        directional_ascii, distance_squared, enhanced_samples, external_bounds, external_samples,
+        internal_samples, match_image, mean_region, output_rows, scale_to_density,
     };
     use crate::font_atlas::FontAtlas;
-    use crate::preprocess::{WorkImage, cell_region_bounds, preprocess};
+    use crate::preprocess::{
+        CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, preprocess,
+        shape_density,
+    };
+    use crate::tone::ToneMap;
 
     fn gradient_image(width: u32, height: u32) -> DynamicImage {
         let mut image = RgbImage::new(width, height);
@@ -478,6 +485,63 @@ mod tests {
             color: false,
             braille: false,
         }
+    }
+
+    /// 亮暗竖条对齐单元边界：右邻域比内部亮、左邻域更暗，外部样本逐分量不均匀。
+    fn striped_image(width: u32, height: u32) -> DynamicImage {
+        let mut image = RgbImage::new(width, height);
+        for y in 0..height {
+            let base = 0.35 + 0.3 * y as f32 / height as f32;
+            for x in 0..width {
+                let level = if x % CELL_WIDTH < CELL_WIDTH / 2 {
+                    0.9
+                } else {
+                    0.1
+                };
+                let value = (level * base * 255.0).round() as u8;
+                image.put_pixel(x, y, Rgb([value, value, value]));
+            }
+        }
+        DynamicImage::ImageRgb8(image)
+    }
+
+    /// 只按顺序拼装现有元件：先 crunch，再等比缩放模长，最后选字。
+    fn reference_serial_chars(
+        image: &ProcessedImage,
+        atlas: &FontAtlas,
+        config: &MatchConfig,
+    ) -> Vec<char> {
+        let rows = output_rows(config.cols, image.width, image.height).unwrap();
+        let work = image
+            .resample(config.cols * CELL_WIDTH, rows * CELL_HEIGHT)
+            .unwrap();
+        let mut errors = vec![0.0_f32; (config.cols * rows) as usize];
+        let mut chars = Vec::new();
+        for row in 0..rows {
+            for col in 0..config.cols {
+                let index = (row * config.cols + col) as usize;
+                let enhanced = enhanced_samples(&work, col, row, config.dir_crunch);
+                let target = (shape_density(enhanced) + errors[index]).clamp(0.0, 1.0);
+                let cell = build_ascii_cell(
+                    image,
+                    atlas,
+                    config,
+                    &work,
+                    CellPosition { col, row, rows },
+                    scale_to_density(enhanced, target),
+                );
+                diffuse_scalar_error(
+                    config.cols,
+                    rows,
+                    col,
+                    row,
+                    target - cell.density,
+                    &mut errors,
+                );
+                chars.push(cell.ch);
+            }
+        }
+        chars
     }
 
     #[test]
@@ -554,7 +618,7 @@ mod tests {
     #[test]
     fn dithering_changes_matching_and_serial_output_is_deterministic() {
         let image = gradient_image(32, 32);
-        let processed = preprocess(&image, 1.0, 0.0).unwrap();
+        let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
         let atlas = FontAtlas::load().unwrap();
         let plain = match_image(&processed, &atlas, &config(false)).unwrap();
         let dithered = match_image(&processed, &atlas, &config(true)).unwrap();
@@ -578,7 +642,7 @@ mod tests {
     #[test]
     fn mid_gray_dither_keeps_average_error_in_shape_density_units() {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(32, 32, Rgb([128, 128, 128])));
-        let processed = preprocess(&image, 1.0, 0.0).unwrap();
+        let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
         let atlas = FontAtlas::load().unwrap();
         let art = match_image(&processed, &atlas, &config(true)).unwrap();
         let target = 128.0_f32 / 255.0;
@@ -595,7 +659,7 @@ mod tests {
     #[test]
     fn parallel_matching_is_deterministic() {
         let image = gradient_image(32, 32);
-        let processed = preprocess(&image, 1.0, 0.0).unwrap();
+        let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
         let atlas = FontAtlas::load().unwrap();
         let first = match_image(&processed, &atlas, &config(false)).unwrap();
         let second = match_image(&processed, &atlas, &config(false)).unwrap();
@@ -606,9 +670,149 @@ mod tests {
     }
 
     #[test]
+    fn density_scaling_keeps_direction_and_handles_zero_and_saturation() {
+        let raw = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let scaled = scale_to_density(raw, 0.3);
+        assert!((shape_density(scaled) - 0.3).abs() < 1.0e-6);
+        for component in 1..6 {
+            assert!((scaled[component] / scaled[0] - raw[component] / raw[0]).abs() < 1.0e-6);
+        }
+
+        let zero = scale_to_density([0.0; 6], 0.25);
+        assert_eq!(zero, [0.25; 6]);
+        assert!((shape_density(zero) - 0.25).abs() < 1.0e-6);
+
+        let saturated = scale_to_density([0.9, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0);
+        assert_eq!(saturated[0], 1.0);
+        assert!(
+            saturated
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        );
+    }
+
+    #[test]
+    fn saturation_scales_every_component_by_one_factor() {
+        let raw = [0.75, 0.5, 0.25, 0.2, 0.1, 0.05];
+        let scaled = scale_to_density(raw, 1.0);
+        let cap = 1.0 / raw[0];
+        for (value, source) in scaled.into_iter().zip(raw) {
+            assert!((value - source * cap).abs() < 1.0e-6, "value={value}");
+            assert!((0.0..=1.0).contains(&value));
+        }
+        assert!((scaled[0] - 1.0).abs() < 1.0e-6);
+        let reached = shape_density(scaled);
+        assert!((reached - shape_density(raw) * cap).abs() < 1.0e-6);
+        assert!(reached < 1.0, "饱和后目标密度达不到，残差留给扩散");
+    }
+
+    #[test]
+    fn scaling_before_crunch_would_move_the_suppressed_direction() {
+        let raw = [0.3, 0.06, 0.3, 0.06, 0.3, 0.06];
+        let external = [0.0, 0.3, 0.0, 0.3, 0.0, 0.3];
+        let enhanced = dir_crunch(raw, external, 2.5);
+        let scaled = scale_to_density(enhanced, 0.35);
+        for component in 1..6 {
+            let ratio = scaled[component] / scaled[0];
+            let reference = enhanced[component] / enhanced[0];
+            assert!((ratio - reference).abs() < 1.0e-6, "ratio={ratio}");
+        }
+
+        let reordered = dir_crunch(scale_to_density(raw, 0.35), external, 2.5);
+        let reordered_ratio = reordered[1] / reordered[0];
+        let kept_ratio = scaled[1] / scaled[0];
+        assert!(
+            reordered_ratio > 2.0 * kept_ratio,
+            "先缩放再 crunch 会降低外部抑制：{reordered_ratio} vs {kept_ratio}"
+        );
+    }
+
+    #[test]
+    fn dither_rescales_the_crunched_shape_on_uneven_external_neighborhoods() {
+        let image = striped_image(40, 40);
+        let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
+        let atlas = FontAtlas::load().unwrap();
+        let mut conf = config(true);
+        conf.edge_weight = 0.0;
+
+        // 前置条件：确实有分量碰上了更亮的相邻外部，dir_crunch 的阈值会介入。
+        let rows = output_rows(conf.cols, processed.width, processed.height).unwrap();
+        let work = processed
+            .resample(conf.cols * CELL_WIDTH, rows * CELL_HEIGHT)
+            .unwrap();
+        let suppressed: usize = (0..rows)
+            .flat_map(|row| (0..conf.cols).map(move |col| (col, row)))
+            .map(|(col, row)| {
+                let raw = internal_samples(&work, col, row);
+                let external = external_samples(&work, col, row);
+                raw.into_iter()
+                    .zip(external)
+                    .filter(|(inside, outside)| outside > inside)
+                    .count()
+            })
+            .sum();
+        assert!(suppressed > 0, "样本没有跨过外部阈值，测不到顺序差异");
+
+        let art = match_image(&processed, &atlas, &conf).unwrap();
+        let actual: Vec<char> = art.cells.iter().map(|cell| cell.ch).collect();
+        assert_eq!(actual, reference_serial_chars(&processed, &atlas, &conf));
+    }
+
+    #[test]
+    fn mono_foreground_uses_cell_luminance_instead_of_white() {
+        let atlas = FontAtlas::load().unwrap();
+        for (value, expected) in [(0_u8, 64_u8), (128, 160), (255, 255)] {
+            let image =
+                DynamicImage::ImageRgb8(RgbImage::from_pixel(10, 20, Rgb([value, value, value])));
+            let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
+            let art = match_image(&processed, &atlas, &config(false)).unwrap();
+            assert!(
+                art.cells.iter().all(|cell| cell.fg_color == [expected; 3]),
+                "value={value}, fg={:?}",
+                art.cells[0].fg_color
+            );
+        }
+    }
+
+    #[test]
+    fn braille_known_codepoint_uses_top_left_dot_bit() {
+        let mut image = RgbImage::from_pixel(10, 20, Rgb([0, 0, 0]));
+        for y in 0..5 {
+            for x in 0..5 {
+                image.put_pixel(x, y, Rgb([255, 255, 255]));
+            }
+        }
+        let processed =
+            preprocess(&DynamicImage::ImageRgb8(image), 1.0, 0.0, ToneMap::Global).unwrap();
+        let atlas = FontAtlas::load().unwrap();
+        let mut braille = config(false);
+        braille.cols = 1;
+        braille.braille = true;
+        let art = match_image(&processed, &atlas, &braille).unwrap();
+        assert_eq!(art.cells.len(), 1);
+        assert_eq!(art.cells[0].ch, '\u{2801}');
+    }
+
+    #[test]
+    fn braille_dither_uses_bayer_thresholds_per_dot() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 40, Rgb([128, 128, 128])));
+        let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
+        let atlas = FontAtlas::load().unwrap();
+        let mut dithered = config(true);
+        dithered.braille = true;
+        let art = match_image(&processed, &atlas, &dithered).unwrap();
+        assert!(art.cells.iter().all(|cell| cell.density == 0.5));
+
+        let mut plain = dithered.clone();
+        plain.dither = false;
+        let plain_art = match_image(&processed, &atlas, &plain).unwrap();
+        assert!(plain_art.cells.iter().all(|cell| cell.density == 1.0));
+    }
+
+    #[test]
     fn braille_matching_emits_only_real_braille_scalars() {
         let image = gradient_image(32, 32);
-        let processed = preprocess(&image, 1.0, 0.0).unwrap();
+        let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
         let atlas = FontAtlas::load().unwrap();
         let mut braille_config = config(false);
         braille_config.braille = true;

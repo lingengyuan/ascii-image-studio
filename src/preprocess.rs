@@ -1,6 +1,8 @@
 use anyhow::{Result, ensure};
 use image::DynamicImage;
 
+use crate::tone::{ToneMap, apply as apply_tone_map};
+
 pub const CELL_WIDTH: u32 = 10;
 pub const CELL_HEIGHT: u32 = 20;
 pub const SHAPE_AREA_WEIGHTS: [f32; 6] = [0.15, 0.15, 0.175, 0.175, 0.175, 0.175];
@@ -14,6 +16,8 @@ pub struct ProcessedImage {
     pub width: u32,
     pub height: u32,
     luma: Vec<f32>,
+    /// 合成到黑底后的原始亮度，只用于前景明度，不参与匹配。
+    display_luma: Vec<f32>,
     normal_x: Vec<f32>,
     normal_y: Vec<f32>,
     edge_strength: Vec<f32>,
@@ -47,7 +51,12 @@ pub fn shape_density(shape: [f32; 6]) -> f32 {
         .sum()
 }
 
-pub fn preprocess(image: &DynamicImage, contrast: f32, edge_weight: f32) -> Result<ProcessedImage> {
+pub fn preprocess(
+    image: &DynamicImage,
+    contrast: f32,
+    edge_weight: f32,
+    tone_map: ToneMap,
+) -> Result<ProcessedImage> {
     ensure!(
         contrast.is_finite() && contrast > 0.0,
         "contrast 必须是有限正数"
@@ -78,8 +87,9 @@ pub fn preprocess(image: &DynamicImage, contrast: f32, edge_weight: f32) -> Resu
         );
         colors.push([red, green, blue]);
     }
+    let display_luma = luma.clone();
 
-    stretch_luminance(&mut luma, contrast)?;
+    apply_tone_map(&mut luma, width, height, tone_map, contrast)?;
 
     let (normal_x, normal_y, edge_strength) = if edge_weight > 0.0 {
         edge_maps(&luma, width, height)
@@ -96,6 +106,7 @@ pub fn preprocess(image: &DynamicImage, contrast: f32, edge_weight: f32) -> Resu
         width,
         height,
         luma,
+        display_luma,
         normal_x,
         normal_y,
         edge_strength,
@@ -105,37 +116,6 @@ pub fn preprocess(image: &DynamicImage, contrast: f32, edge_weight: f32) -> Resu
 
 fn composite_on_black(channel: u8, alpha: u16) -> u8 {
     ((u16::from(channel) * alpha + 127) / 255) as u8
-}
-
-pub(crate) fn stretch_luminance(luma: &mut [f32], contrast: f32) -> Result<()> {
-    ensure!(!luma.is_empty(), "输入图片不能为空");
-    ensure!(
-        contrast.is_finite() && contrast > 0.0,
-        "contrast 必须是有限正数"
-    );
-
-    let mut sorted = luma.to_vec();
-    sorted.sort_by(f32::total_cmp);
-    let p01 = quantile(&sorted, 0.01);
-    let p99 = quantile(&sorted, 0.99);
-
-    for value in luma {
-        let stretched = if p99 - p01 <= SIGNAL_EPSILON {
-            *value
-        } else {
-            ((*value - p01) / (p99 - p01)).clamp(0.0, 1.0)
-        };
-        *value = stretched.powf(contrast).clamp(0.0, 1.0);
-    }
-    Ok(())
-}
-
-fn quantile(sorted: &[f32], fraction: f64) -> f32 {
-    let position = fraction * (sorted.len() - 1) as f64;
-    let lower = position.floor() as usize;
-    let upper = position.ceil() as usize;
-    let weight = (position - lower as f64) as f32;
-    sorted[lower] * (1.0 - weight) + sorted[upper] * weight
 }
 
 fn edge_maps(luma: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -307,14 +287,7 @@ impl ProcessedImage {
     }
 
     pub fn cell_highlight_color(&self, cols: u32, rows: u32, col: u32, row: u32) -> [u8; 3] {
-        let x0 = u64::from(col) * u64::from(self.width) / u64::from(cols);
-        let x1 = (u64::from(col + 1) * u64::from(self.width) / u64::from(cols))
-            .max(x0 + 1)
-            .min(u64::from(self.width));
-        let y0 = u64::from(row) * u64::from(self.height) / u64::from(rows);
-        let y1 = (u64::from(row + 1) * u64::from(self.height) / u64::from(rows))
-            .max(y0 + 1)
-            .min(u64::from(self.height));
+        let (x0, y0, x1, y1) = self.cell_bounds(cols, rows, col, row);
 
         let mut max_luma = 0.0_f32;
         for y in y0..y1 {
@@ -344,6 +317,32 @@ impl ProcessedImage {
         }
         sums.map(|sum| (sum / count).round().clamp(0.0, 255.0) as u8)
     }
+
+    /// 单元在原始合成亮度上的平均值，用于调制前景明度。
+    pub fn cell_luminance(&self, cols: u32, rows: u32, col: u32, row: u32) -> f32 {
+        let (x0, y0, x1, y1) = self.cell_bounds(cols, rows, col, row);
+        let mut sum = 0.0_f64;
+        let mut count = 0_u64;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                sum += f64::from(self.display_luma[y as usize * self.width as usize + x as usize]);
+                count += 1;
+            }
+        }
+        (sum / count.max(1) as f64) as f32
+    }
+
+    fn cell_bounds(&self, cols: u32, rows: u32, col: u32, row: u32) -> (u32, u32, u32, u32) {
+        let x0 = u64::from(col) * u64::from(self.width) / u64::from(cols);
+        let x1 = (u64::from(col + 1) * u64::from(self.width) / u64::from(cols))
+            .max(x0 + 1)
+            .min(u64::from(self.width));
+        let y0 = u64::from(row) * u64::from(self.height) / u64::from(rows);
+        let y1 = (u64::from(row + 1) * u64::from(self.height) / u64::from(rows))
+            .max(y0 + 1)
+            .min(u64::from(self.height));
+        (x0 as u32, y0 as u32, x1 as u32, y1 as u32)
+    }
 }
 
 fn bilinear(
@@ -371,38 +370,33 @@ fn color_luma(color: [u8; 3]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use image::{DynamicImage, GrayImage, Luma};
+    use image::{DynamicImage, GrayImage, Luma, Rgb, RgbImage};
 
-    use super::{gaussian_blur, preprocess, stretch_luminance};
+    use crate::tone::ToneMap;
+
+    use super::{gaussian_blur, preprocess};
 
     #[test]
     fn bt601_red_and_green_have_expected_luminance() {
         let mut red = GrayImage::new(1, 1);
         red.put_pixel(0, 0, Luma([0]));
         let red = DynamicImage::ImageLuma8(red);
-        let processed = preprocess(&red, 1.0, 0.0).unwrap();
+        let processed = preprocess(&red, 1.0, 0.0, ToneMap::Global).unwrap();
         assert!(processed.luma[0].abs() < 1.0e-6);
 
-        let rgb =
-            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])));
-        let processed = preprocess(&rgb, 1.0, 0.0).unwrap();
+        let rgb = DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, Rgb([255, 0, 0])));
+        let processed = preprocess(&rgb, 1.0, 0.0, ToneMap::Global).unwrap();
         assert!((processed.luma[0] - 0.299).abs() < 1.0e-4);
     }
 
     #[test]
-    fn percentile_stretch_is_identity_for_constant_image() {
-        let mut values = vec![0.73; 32];
-        stretch_luminance(&mut values, 1.3).unwrap();
-        assert!(
-            values
-                .iter()
-                .all(|value| (*value - 0.73_f32.powf(1.3)).abs() < 1.0e-6)
-        );
-    }
-
-    #[test]
-    fn percentile_stretch_rejects_empty_input() {
-        assert!(stretch_luminance(&mut [], 1.3).is_err());
+    fn display_luminance_ignores_tone_mapping_and_edges() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 4, Rgb([128, 128, 128])));
+        let processed = preprocess(&image, 3.0, 1.0, ToneMap::Clahe).unwrap();
+        let expected = 128.0 / 255.0;
+        assert!((processed.display_luma[0] - expected).abs() < 1.0e-6);
+        assert!((processed.cell_luminance(1, 1, 0, 0) - expected).abs() < 1.0e-6);
+        assert!((processed.luma[0] - expected).abs() > 1.0e-3);
     }
 
     #[test]
@@ -419,7 +413,7 @@ mod tests {
             4,
             image::Rgb([128, 128, 128]),
         ));
-        let processed = preprocess(&image, 1.0, 0.0).unwrap();
+        let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
         let work = processed.resample(20, 40).unwrap();
         assert!(
             work.luma

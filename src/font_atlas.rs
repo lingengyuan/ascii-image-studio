@@ -32,6 +32,9 @@ pub const BRAILLE_LAYOUT: [(usize, usize); 8] = [
     (3, 1),
 ];
 
+/// 2x4 Bayer 阈值矩阵。行、列分别对应盲文点位行和列。
+pub const BRAILLE_BAYER: [[u8; 2]; 4] = [[0, 4], [2, 6], [1, 5], [3, 7]];
+
 impl FontAtlas {
     pub fn load() -> Result<Self> {
         let font = Font::from_bytes(FONT_BYTES, FontSettings::default())
