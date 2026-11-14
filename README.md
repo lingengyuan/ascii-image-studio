@@ -65,11 +65,19 @@ cargo build --release
 
 `scripts/compare-grid.sh photo.jpg` 生成 `--dir-crunch` 与 `--edge-weight` 的 3x3 拼图，输出 `output/compare/<图片名>/grid.png`。拼图需要 Python 3 与 Pillow，仅用于开发比较。
 
+`python3 scripts/eval.py` 运行固定的 P0 评测基线，结果写入 `target/eval/results.json` 和 `docs/eval-baseline.md`。评测依赖固定版本：
+
+```bash
+python3 -m pip install -r scripts/requirements-eval.txt
+```
+
 CI 在推送和拉取请求时运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features`，并构建 Linux x86_64、macOS arm64、macOS x86_64、Windows x86_64 四个平台的二进制。工作流定义见 `.github/workflows/ci.yml`。
 
 ## 许可
 
 内嵌字体为 [JetBrains Mono Regular](https://github.com/JetBrains/JetBrainsMono)，按 SIL Open Font License 1.1 使用。许可证见 `assets/OFL.txt`。
+
+`scripts/eval.py` 的 FSIM 指标移植自 [FeatureSIM.m](https://cslinzhang.github.io/home/FSIM/Files/FeatureSIM.m)。该部分按上游条款仅用于教育/研究用途，不适用本仓库的 MIT 许可，商用前需取得原作者许可。全文见 `scripts/NOTICE-eval.md`。
 
 示例图片取自 Wikimedia Commons：
 

@@ -52,6 +52,10 @@ pub struct Cli {
     /// 使用 2x4 盲文点阵字符
     #[arg(long)]
     pub braille: bool,
+
+    /// 仅供评测导出最终亮度，正常渲染不使用
+    #[arg(long, hide = true)]
+    pub dump_processed: Option<PathBuf>,
 }
 
 /// 显式宽度优先；文件输出固定 160；只有终端输出才使用窗口列数。

@@ -223,6 +223,11 @@ fn sample_clamped(values: &[f32], width: u32, height: u32, x: isize, y: isize) -
 }
 
 impl ProcessedImage {
+    /// 暴露最终匹配亮度，供评测脚本导出对照图；不参与匹配。
+    pub fn luma(&self) -> &[f32] {
+        &self.luma
+    }
+
     pub fn resample(&self, width: u32, height: u32) -> Result<WorkImage> {
         ensure!(width > 0 && height > 0, "工作图尺寸必须大于 0");
         let pixel_count = usize::try_from(u64::from(width) * u64::from(height))
