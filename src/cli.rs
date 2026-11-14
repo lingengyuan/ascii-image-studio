@@ -56,6 +56,10 @@ pub struct Cli {
     /// 仅供评测导出最终亮度，正常渲染不使用
     #[arg(long, hide = true)]
     pub dump_processed: Option<PathBuf>,
+
+    /// 仅供诊断导出平滑后的方向场，正常渲染不使用
+    #[arg(long, hide = true)]
+    pub dump_direction: Option<PathBuf>,
 }
 
 /// 显式宽度优先；文件输出固定 160；只有终端输出才使用窗口列数。

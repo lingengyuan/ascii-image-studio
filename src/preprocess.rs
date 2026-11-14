@@ -11,6 +11,9 @@ const BT601_R: f32 = 0.299;
 const BT601_G: f32 = 0.587;
 const BT601_B: f32 = 0.114;
 const SIGNAL_EPSILON: f32 = 1.0e-6;
+const DIRECTION_SMOOTH_SIGMA: f32 = 2.0;
+const DIRECTION_SMOOTH_MIN_COHERENCE: f32 = 0.25;
+const DIRECTION_WEIGHT_EPSILON: f32 = 1.0e-4;
 
 pub struct ProcessedImage {
     pub width: u32,
@@ -28,8 +31,10 @@ pub struct WorkImage {
     pub width: u32,
     pub height: u32,
     pub luma: Vec<f32>,
-    pub normal_x: Vec<f32>,
-    pub normal_y: Vec<f32>,
+    /// 双角度分量（cos 2θ），插值不会因 180° 反相而抵消。
+    pub direction_cos2: Vec<f32>,
+    /// 双角度分量（sin 2θ）。
+    pub direction_sin2: Vec<f32>,
     pub edge_strength: Vec<f32>,
 }
 
@@ -165,7 +170,52 @@ fn edge_maps(luma: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<f32>, Vec<
         }
     }
 
+    smooth_edge_directions(&mut normal_x, &mut normal_y, &magnitudes, width, height);
+
     (normal_x, normal_y, magnitudes, dog)
+}
+
+/// 边缘方向以 180° 为周期，直接平均会让相对的两侧互相抵消。
+/// 在双角度域按边缘强度加权平滑，再还原角度，就能跨过反相边界。
+fn smooth_edge_directions(
+    normal_x: &mut [f32],
+    normal_y: &mut [f32],
+    edge_strength: &[f32],
+    width: u32,
+    height: u32,
+) {
+    let cos_double: Vec<f32> = normal_x
+        .iter()
+        .zip(normal_y.iter())
+        .zip(edge_strength)
+        .map(|((nx, ny), weight)| (nx * nx - ny * ny) * weight)
+        .collect();
+    let sin_double: Vec<f32> = normal_x
+        .iter()
+        .zip(normal_y.iter())
+        .zip(edge_strength)
+        .map(|((nx, ny), weight)| 2.0 * nx * ny * weight)
+        .collect();
+
+    let smooth_cos = gaussian_blur(&cos_double, width, height, DIRECTION_SMOOTH_SIGMA);
+    let smooth_sin = gaussian_blur(&sin_double, width, height, DIRECTION_SMOOTH_SIGMA);
+    let smooth_weight = gaussian_blur(edge_strength, width, height, DIRECTION_SMOOTH_SIGMA);
+
+    for index in 0..normal_x.len() {
+        if smooth_weight[index] <= DIRECTION_WEIGHT_EPSILON {
+            continue;
+        }
+        // 局部相干度低说明没有单一方向，置零比编造一个方向更诚实。
+        let coherence = smooth_cos[index].hypot(smooth_sin[index]) / smooth_weight[index];
+        if coherence < DIRECTION_SMOOTH_MIN_COHERENCE {
+            normal_x[index] = 0.0;
+            normal_y[index] = 0.0;
+            continue;
+        }
+        let theta = 0.5 * smooth_sin[index].atan2(smooth_cos[index]);
+        normal_x[index] = theta.cos();
+        normal_y[index] = theta.sin();
+    }
 }
 
 /// 有符号 DoG 非锐化掩模：亮侧更亮、暗侧更暗。
@@ -228,13 +278,36 @@ impl ProcessedImage {
         &self.luma
     }
 
+    /// 平滑后的单位法向，仅供隐藏的方向诊断图读取。
+    pub fn edge_normals(&self) -> (&[f32], &[f32]) {
+        (&self.normal_x, &self.normal_y)
+    }
+
+    /// 归一化边缘强度，仅供隐藏的方向诊断图读取。
+    pub fn edge_strength(&self) -> &[f32] {
+        &self.edge_strength
+    }
+
     pub fn resample(&self, width: u32, height: u32) -> Result<WorkImage> {
         ensure!(width > 0 && height > 0, "工作图尺寸必须大于 0");
         let pixel_count = usize::try_from(u64::from(width) * u64::from(height))
             .map_err(|_| anyhow::anyhow!("工作图尺寸超出可处理范围"))?;
+        // 先换算到双角度域再插值，相邻反相法向才不会互相抵消。
+        let direction_cos2: Vec<f32> = self
+            .normal_x
+            .iter()
+            .zip(&self.normal_y)
+            .map(|(normal_x, normal_y)| normal_x * normal_x - normal_y * normal_y)
+            .collect();
+        let direction_sin2: Vec<f32> = self
+            .normal_x
+            .iter()
+            .zip(&self.normal_y)
+            .map(|(normal_x, normal_y)| 2.0 * normal_x * normal_y)
+            .collect();
         let mut luma = Vec::with_capacity(pixel_count);
-        let mut normal_x = Vec::with_capacity(pixel_count);
-        let mut normal_y = Vec::with_capacity(pixel_count);
+        let mut direction_cos2_out = Vec::with_capacity(pixel_count);
+        let mut direction_sin2_out = Vec::with_capacity(pixel_count);
         let mut edge_strength = Vec::with_capacity(pixel_count);
 
         for y in 0..height {
@@ -254,8 +327,8 @@ impl ProcessedImage {
                     tx,
                     ty,
                 ));
-                normal_x.push(bilinear(
-                    &self.normal_x,
+                direction_cos2_out.push(bilinear(
+                    &direction_cos2,
                     self.width,
                     self.height,
                     x0,
@@ -263,8 +336,8 @@ impl ProcessedImage {
                     tx,
                     ty,
                 ));
-                normal_y.push(bilinear(
-                    &self.normal_y,
+                direction_sin2_out.push(bilinear(
+                    &direction_sin2,
                     self.width,
                     self.height,
                     x0,
@@ -288,8 +361,8 @@ impl ProcessedImage {
             width,
             height,
             luma,
-            normal_x,
-            normal_y,
+            direction_cos2: direction_cos2_out,
+            direction_sin2: direction_sin2_out,
             edge_strength,
         })
     }
@@ -382,7 +455,7 @@ mod tests {
 
     use crate::tone::ToneMap;
 
-    use super::{gaussian_blur, preprocess};
+    use super::{ProcessedImage, gaussian_blur, preprocess, smooth_edge_directions};
 
     #[test]
     fn bt601_red_and_green_have_expected_luminance() {
@@ -412,6 +485,87 @@ mod tests {
         let values = vec![0.42; 7 * 5];
         let blurred = gaussian_blur(&values, 7, 5, 1.6);
         assert!(blurred.iter().all(|value| (*value - 0.42).abs() < 1.0e-5));
+    }
+
+    /// 24 个交替法向的朴素平均恰好为零（25 个像素无法对半分，余下一个弱像素）；
+    /// 双角度平滑后所有像素都应指向 x 轴。
+    #[test]
+    fn direction_smoothing_keeps_opposing_normals_aligned() {
+        let (width, height) = (5, 5);
+        let mut normal_x = vec![0.0_f32; (width * height) as usize];
+        let mut normal_y = vec![0.0_f32; (width * height) as usize];
+        let mut edge_strength = vec![1.0_f32; (width * height) as usize];
+        for (index, value) in normal_x.iter_mut().enumerate() {
+            *value = if index % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let weak = (width * height / 2) as usize;
+        normal_x[weak] = 0.0;
+        edge_strength[weak] = 0.0;
+
+        smooth_edge_directions(&mut normal_x, &mut normal_y, &edge_strength, width, height);
+
+        for (nx, ny) in normal_x.into_iter().zip(normal_y) {
+            // 只查 |nx| 会放过未平滑的反相原值，这里要求统一指向 +x。
+            assert!(nx > 0.9, "nx={nx}");
+            assert!(ny.abs() < 0.1, "ny={ny}");
+        }
+    }
+
+    /// 交替的正交法向在双角度域互相抵消，中心区域相干度接近零，应被置零。
+    #[test]
+    fn checkerboard_orthogonal_normals_are_zeroed_after_smoothing() {
+        let (width, height) = (16, 16);
+        let mut normal_x = vec![0.0_f32; (width * height) as usize];
+        let mut normal_y = vec![0.0_f32; (width * height) as usize];
+        let edge_strength = vec![1.0_f32; (width * height) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let index = (y * width + x) as usize;
+                if (x + y) % 2 == 0 {
+                    normal_x[index] = 1.0;
+                } else {
+                    normal_y[index] = 1.0;
+                }
+            }
+        }
+
+        smooth_edge_directions(&mut normal_x, &mut normal_y, &edge_strength, width, height);
+
+        for y in 6..10 {
+            for x in 6..10 {
+                let index = (y * width + x) as usize;
+                assert_eq!(normal_x[index], 0.0, "x={x}, y={y}");
+                assert_eq!(normal_y[index], 0.0, "x={x}, y={y}");
+            }
+        }
+    }
+
+    #[test]
+    fn resampling_uses_double_angle_domain() {
+        // 相邻像素法向接近 +90° 和 -90°，直接插值单位法向会得到近水平向量。
+        let angle = 89.8_f32.to_radians();
+        let normal_x = angle.cos();
+        let normal_y = angle.sin();
+        let processed = ProcessedImage {
+            width: 2,
+            height: 1,
+            luma: vec![0.5; 2],
+            display_luma: vec![0.5; 2],
+            normal_x: vec![normal_x, normal_x],
+            normal_y: vec![normal_y, -normal_y],
+            edge_strength: vec![1.0; 2],
+            colors: vec![[128, 128, 128]; 2],
+        };
+
+        let work = processed.resample(3, 1).unwrap();
+        let middle = work.direction_cos2[1];
+        let sin2 = work.direction_sin2[1];
+        assert!(middle < -0.99, "cos2={middle}");
+        assert!(sin2.abs() < 0.01, "sin2={sin2}");
+
+        let theta = 0.5 * sin2.atan2(middle);
+        assert!(theta.cos().abs() < 0.1, "nx={}", theta.cos());
+        assert!(theta.sin() > 0.99, "ny={}", theta.sin());
     }
 
     #[test]

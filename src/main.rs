@@ -8,7 +8,7 @@ use ascii_image_studio::matcher::{MatchConfig, match_image};
 use ascii_image_studio::preprocess::{ProcessedImage, preprocess};
 use ascii_image_studio::renderer::{OutputKind, render};
 use clap::Parser;
-use image::{GrayImage, ImageFormat, Luma};
+use image::{GrayImage, ImageFormat, Luma, Rgb, RgbImage};
 
 fn main() -> ExitCode {
     match run(Cli::parse()) {
@@ -34,6 +34,9 @@ fn run(cli: Cli) -> Result<()> {
     if let Some(path) = &cli.dump_processed {
         dump_processed(path, &processed)?;
     }
+    if let Some(path) = &cli.dump_direction {
+        dump_direction(path, &processed)?;
+    }
     let atlas = FontAtlas::load().context("无法初始化内嵌字体")?;
     let config = MatchConfig {
         cols: width,
@@ -56,4 +59,25 @@ fn dump_processed(path: &Path, processed: &ProcessedImage) -> Result<()> {
     image
         .save_with_format(path, ImageFormat::Png)
         .with_context(|| format!("无法写入预处理图 {}", path.display()))
+}
+
+/// 方向诊断图：R/G 是双角度余弦/正弦，B 是边缘强度；正常渲染不读取。
+fn dump_direction(path: &Path, processed: &ProcessedImage) -> Result<()> {
+    let (normal_x, normal_y) = processed.edge_normals();
+    let strength = processed.edge_strength();
+    let mut image = RgbImage::new(processed.width, processed.height);
+    for (index, pixel) in image.pixels_mut().enumerate() {
+        let nx = normal_x[index];
+        let ny = normal_y[index];
+        let cos_double = nx * nx - ny * ny;
+        let sin_double = 2.0 * nx * ny;
+        *pixel = Rgb([
+            ((cos_double + 1.0) * 0.5 * 255.0).round().clamp(0.0, 255.0) as u8,
+            ((sin_double + 1.0) * 0.5 * 255.0).round().clamp(0.0, 255.0) as u8,
+            (strength[index].clamp(0.0, 1.0) * 255.0).round() as u8,
+        ]);
+    }
+    image
+        .save_with_format(path, ImageFormat::Png)
+        .with_context(|| format!("无法写入方向图 {}", path.display()))
 }

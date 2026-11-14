@@ -8,7 +8,15 @@ use crate::preprocess::{
     CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, shape_density,
 };
 
-const DIRECTION_EDGE_THRESHOLD: f32 = 0.55;
+const DIRECTION_PRIOR_WEIGHT: f32 = 0.04;
+const DIRECTION_PRIOR_RAMP_START: f32 = 0.35;
+const DIRECTION_PRIOR_RAMP_END: f32 = 0.70;
+const DIRECTION_MIN_COHERENCE: f32 = 0.25;
+
+const HORIZONTAL_CANDIDATES: &[char] = &['-', '_', '~'];
+const BACKSLASH_CANDIDATES: &[char] = &['\\', '\'', '`', ','];
+const VERTICAL_CANDIDATES: &[char] = &['|', '!', 'l', 'I', '(', ')'];
+const SLASH_CANDIDATES: &[char] = &['/', '(', ')', '\'', '`'];
 
 #[derive(Clone, Debug)]
 pub struct MatchConfig {
@@ -164,15 +172,12 @@ fn build_ascii_cell(
     position: CellPosition,
     enhanced: [f32; 6],
 ) -> AsciiCell {
-    let mut glyph = nearest_glyph(atlas.ascii(), enhanced);
-
-    if config.edge_weight > 0.0
-        && let Some(direction) = edge_direction(work, position.col, position.row)
-        && direction.strength >= DIRECTION_EDGE_THRESHOLD
-        && let Some(directional) = directional_ascii(direction.normal_x, direction.normal_y)
-    {
-        glyph = &atlas.ascii()[directional as usize - 0x20];
-    }
+    let prior = if config.edge_weight > 0.0 {
+        direction_prior(work, position.col, position.row)
+    } else {
+        None
+    };
+    let glyph = nearest_glyph(atlas.ascii(), enhanced, prior.as_ref());
 
     AsciiCell {
         ch: glyph.ch,
@@ -237,14 +242,27 @@ fn build_braille_cell(
     }
 }
 
-fn nearest_glyph(glyphs: &[CharGlyph], target: [f32; 6]) -> &CharGlyph {
+fn nearest_glyph<'a>(
+    glyphs: &'a [CharGlyph],
+    target: [f32; 6],
+    prior: Option<&DirectionPrior>,
+) -> &'a CharGlyph {
     glyphs
         .iter()
         .min_by(|left, right| {
-            distance_squared(left.shape_vec, target)
-                .total_cmp(&distance_squared(right.shape_vec, target))
+            glyph_cost(left, target, prior).total_cmp(&glyph_cost(right, target, prior))
         })
         .expect("ASCII atlas is not empty")
+}
+
+fn glyph_cost(glyph: &CharGlyph, target: [f32; 6], prior: Option<&DirectionPrior>) -> f32 {
+    let mut cost = distance_squared(glyph.shape_vec, target);
+    if let Some(prior) = prior
+        && !prior.candidates.contains(&glyph.ch)
+    {
+        cost += prior.weight;
+    }
+    cost
 }
 
 fn distance_squared(left: [f32; 6], right: [f32; 6]) -> f32 {
@@ -350,31 +368,68 @@ struct EdgeDirection {
     strength: f32,
 }
 
+/// 单元内也按双角度聚合。相干度是双角度能量与边缘强度之和的比值：
+/// 只有方向一致时它才接近 1，方向互相抵消的低相干单元没有先验。
 fn edge_direction(work: &WorkImage, col: u32, row: u32) -> Option<EdgeDirection> {
     let x0 = col * CELL_WIDTH;
     let y0 = row * CELL_HEIGHT;
-    let mut weighted_x = 0.0;
-    let mut weighted_y = 0.0;
-    let mut strength = 0.0;
+    let mut sum_cos = 0.0;
+    let mut sum_sin = 0.0;
+    let mut strength_sum = 0.0;
     for y in y0..y0 + CELL_HEIGHT {
         for x in x0..x0 + CELL_WIDTH {
             let index = y as usize * work.width as usize + x as usize;
             let edge = work.edge_strength[index];
-            weighted_x += work.normal_x[index] * edge;
-            weighted_y += work.normal_y[index] * edge;
-            strength += edge;
+            sum_cos += work.direction_cos2[index] * edge;
+            sum_sin += work.direction_sin2[index] * edge;
+            strength_sum += edge;
         }
     }
-    strength /= (CELL_WIDTH * CELL_HEIGHT) as f32;
-    let length = weighted_x.hypot(weighted_y);
-    (length > 1.0e-6).then(|| EdgeDirection {
-        normal_x: weighted_x / length,
-        normal_y: weighted_y / length,
+    if strength_sum <= 1.0e-6 {
+        return None;
+    }
+    let energy = sum_cos.hypot(sum_sin);
+    if energy / strength_sum < DIRECTION_MIN_COHERENCE {
+        return None;
+    }
+    let strength = strength_sum / (CELL_WIDTH * CELL_HEIGHT) as f32;
+    let theta = 0.5 * sum_sin.atan2(sum_cos);
+    Some(EdgeDirection {
+        normal_x: theta.cos(),
+        normal_y: theta.sin(),
         strength,
     })
 }
 
-pub fn directional_ascii(normal_x: f32, normal_y: f32) -> Option<char> {
+#[derive(Clone, Copy)]
+struct DirectionPrior {
+    candidates: &'static [char],
+    weight: f32,
+}
+
+/// 方向先验只软性加罚：强边缘才生效，弱边缘仍由 6D 形状决定。
+fn direction_prior(work: &WorkImage, col: u32, row: u32) -> Option<DirectionPrior> {
+    let direction = edge_direction(work, col, row)?;
+    let ramp = ((direction.strength - DIRECTION_PRIOR_RAMP_START)
+        / (DIRECTION_PRIOR_RAMP_END - DIRECTION_PRIOR_RAMP_START))
+        .clamp(0.0, 1.0);
+    let weight = DIRECTION_PRIOR_WEIGHT * ramp;
+    if weight <= 0.0 {
+        return None;
+    }
+    let candidates = directional_candidates(direction.normal_x, direction.normal_y)?;
+    Some(DirectionPrior { candidates, weight })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StrokeBin {
+    Horizontal,
+    Backslash,
+    Vertical,
+    Slash,
+}
+
+fn stroke_bin(normal_x: f32, normal_y: f32) -> Option<StrokeBin> {
     if !normal_x.is_finite() || !normal_y.is_finite() || normal_x.hypot(normal_y) <= 1.0e-6 {
         return None;
     }
@@ -382,13 +437,31 @@ pub fn directional_ascii(normal_x: f32, normal_y: f32) -> Option<char> {
         (normal_y.atan2(normal_x) + std::f32::consts::FRAC_PI_2).rem_euclid(std::f32::consts::PI);
     let eighth = std::f32::consts::PI / 8.0;
     Some(if stroke_angle < eighth || stroke_angle >= 7.0 * eighth {
-        '-'
+        StrokeBin::Horizontal
     } else if stroke_angle < 3.0 * eighth {
-        '\\'
+        StrokeBin::Backslash
     } else if stroke_angle < 5.0 * eighth {
-        '|'
+        StrokeBin::Vertical
     } else {
-        '/'
+        StrokeBin::Slash
+    })
+}
+
+pub fn directional_ascii(normal_x: f32, normal_y: f32) -> Option<char> {
+    Some(match stroke_bin(normal_x, normal_y)? {
+        StrokeBin::Horizontal => '-',
+        StrokeBin::Backslash => '\\',
+        StrokeBin::Vertical => '|',
+        StrokeBin::Slash => '/',
+    })
+}
+
+fn directional_candidates(normal_x: f32, normal_y: f32) -> Option<&'static [char]> {
+    Some(match stroke_bin(normal_x, normal_y)? {
+        StrokeBin::Horizontal => HORIZONTAL_CANDIDATES,
+        StrokeBin::Backslash => BACKSLASH_CANDIDATES,
+        StrokeBin::Vertical => VERTICAL_CANDIDATES,
+        StrokeBin::Slash => SLASH_CANDIDATES,
     })
 }
 
@@ -454,9 +527,12 @@ mod tests {
     use image::{DynamicImage, Rgb, RgbImage};
 
     use super::{
-        CellPosition, MatchConfig, build_ascii_cell, diffuse_scalar_error, dir_crunch,
-        directional_ascii, distance_squared, enhanced_samples, external_bounds, external_samples,
-        internal_samples, match_image, mean_region, output_rows, scale_to_density,
+        BACKSLASH_CANDIDATES, CellPosition, DIRECTION_PRIOR_WEIGHT, DirectionPrior,
+        HORIZONTAL_CANDIDATES, MatchConfig, SLASH_CANDIDATES, VERTICAL_CANDIDATES,
+        build_ascii_cell, diffuse_scalar_error, dir_crunch, direction_prior, directional_ascii,
+        directional_candidates, distance_squared, edge_direction, enhanced_samples,
+        external_bounds, external_samples, internal_samples, match_image, mean_region,
+        nearest_glyph, output_rows, scale_to_density,
     };
     use crate::font_atlas::FontAtlas;
     use crate::preprocess::{
@@ -566,13 +642,163 @@ mod tests {
     }
 
     #[test]
+    fn directional_candidates_follow_the_same_stroke_bins() {
+        assert_eq!(
+            directional_candidates(0.0, 1.0),
+            Some(HORIZONTAL_CANDIDATES)
+        );
+        assert_eq!(
+            directional_candidates(
+                std::f32::consts::FRAC_1_SQRT_2,
+                -std::f32::consts::FRAC_1_SQRT_2
+            ),
+            Some(BACKSLASH_CANDIDATES)
+        );
+        assert_eq!(directional_candidates(1.0, 0.0), Some(VERTICAL_CANDIDATES));
+        assert_eq!(
+            directional_candidates(
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2
+            ),
+            Some(SLASH_CANDIDATES)
+        );
+        assert_eq!(directional_candidates(0.0, 0.0), None);
+    }
+
+    #[test]
+    fn zero_weight_prior_does_not_change_the_chosen_glyph() {
+        let atlas = FontAtlas::load().unwrap();
+        let prior = DirectionPrior {
+            candidates: VERTICAL_CANDIDATES,
+            weight: 0.0,
+        };
+        for target in [[0.0; 6], [0.5; 6], [1.0; 6], [0.2, 0.8, 0.4, 0.1, 0.6, 0.3]] {
+            assert_eq!(
+                nearest_glyph(atlas.ascii(), target, Some(&prior)).ch,
+                nearest_glyph(atlas.ascii(), target, None).ch
+            );
+        }
+    }
+
+    #[test]
+    fn large_weight_prior_selects_a_directional_candidate() {
+        let atlas = FontAtlas::load().unwrap();
+        // 6D 距离平方最大为 6，权重 10 足以压过任何非候选字。
+        let prior = DirectionPrior {
+            candidates: HORIZONTAL_CANDIDATES,
+            weight: 10.0,
+        };
+        let glyph = nearest_glyph(atlas.ascii(), [0.5; 6], Some(&prior));
+        assert!(HORIZONTAL_CANDIDATES.contains(&glyph.ch), "ch={}", glyph.ch);
+    }
+
+    fn uniform_work_cell(direction_cos2: f32, edge_strength: f32) -> WorkImage {
+        let pixel_count = (CELL_WIDTH * CELL_HEIGHT) as usize;
+        WorkImage {
+            width: CELL_WIDTH,
+            height: CELL_HEIGHT,
+            luma: vec![0.0; pixel_count],
+            direction_cos2: vec![direction_cos2; pixel_count],
+            direction_sin2: vec![0.0; pixel_count],
+            edge_strength: vec![edge_strength; pixel_count],
+        }
+    }
+
+    #[test]
+    fn incoherent_cell_has_no_prior() {
+        let mut incoherent = uniform_work_cell(1.0, 1.0);
+        let half = incoherent.direction_cos2.len() / 2;
+        incoherent.direction_cos2[half..].fill(-1.0);
+        assert!(edge_direction(&incoherent, 0, 0).is_none());
+        assert!(direction_prior(&incoherent, 0, 0).is_none());
+
+        // 60/40 反相的绝对和不为零，旧的绝对和检查会误判为有方向。
+        let mut mostly_positive = uniform_work_cell(1.0, 1.0);
+        let sixty_percent = mostly_positive.direction_cos2.len() * 3 / 5;
+        mostly_positive.direction_cos2[sixty_percent..].fill(-1.0);
+        assert!(edge_direction(&mostly_positive, 0, 0).is_none());
+        assert!(direction_prior(&mostly_positive, 0, 0).is_none());
+
+        let coherent = uniform_work_cell(1.0, 1.0);
+        assert!(edge_direction(&coherent, 0, 0).is_some());
+        assert!(direction_prior(&coherent, 0, 0).is_some());
+    }
+
+    #[test]
+    fn real_weight_prior_allows_non_candidate_shape_to_win() {
+        let atlas = FontAtlas::load().unwrap();
+        let work = uniform_work_cell(1.0, 1.0);
+        let prior = direction_prior(&work, 0, 0).expect("coherent cell has a prior");
+        assert_eq!(prior.candidates, VERTICAL_CANDIDATES);
+        assert!(
+            (prior.weight - DIRECTION_PRIOR_WEIGHT).abs() < 1.0e-6,
+            "weight={}",
+            prior.weight
+        );
+
+        let target = atlas
+            .ascii()
+            .iter()
+            .find(|glyph| glyph.ch == 'A')
+            .expect("atlas contains A")
+            .shape_vec;
+        assert!(!VERTICAL_CANDIDATES.contains(&'A'));
+        assert_eq!(nearest_glyph(atlas.ascii(), target, Some(&prior)).ch, 'A');
+    }
+
+    /// 方向先验只软性加罚，形状完全匹配的非候选字 'A' 仍应胜出。
+    #[test]
+    fn build_ascii_cell_keeps_a_better_non_candidate_shape() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(10, 20, Rgb([128, 128, 128])));
+        let processed = preprocess(&image, 1.0, 0.0, ToneMap::default()).unwrap();
+        let atlas = FontAtlas::load().unwrap();
+        let work = WorkImage {
+            width: 10,
+            height: 20,
+            luma: vec![0.5; 200],
+            direction_cos2: vec![1.0; 200],
+            direction_sin2: vec![0.0; 200],
+            edge_strength: vec![1.0; 200],
+        };
+        let config = MatchConfig {
+            cols: 1,
+            dir_crunch: 2.5,
+            edge_weight: 0.25,
+            dither: false,
+            color: false,
+            braille: false,
+        };
+        let target = atlas
+            .ascii()
+            .iter()
+            .find(|glyph| glyph.ch == 'A')
+            .expect("atlas contains A")
+            .shape_vec;
+
+        let cell = build_ascii_cell(
+            &processed,
+            &atlas,
+            &config,
+            &work,
+            CellPosition {
+                col: 0,
+                row: 0,
+                rows: 1,
+            },
+            target,
+        );
+
+        assert_eq!(cell.ch, 'A');
+    }
+
+    #[test]
     fn external_samples_use_regions_touching_the_cell_edge() {
         let mut work = WorkImage {
             width: 30,
             height: 40,
             luma: vec![0.0; 30 * 40],
-            normal_x: vec![0.0; 30 * 40],
-            normal_y: vec![0.0; 30 * 40],
+            direction_cos2: vec![0.0; 30 * 40],
+            direction_sin2: vec![0.0; 30 * 40],
             edge_strength: vec![0.0; 30 * 40],
         };
         for y in 6..13 {
@@ -588,8 +814,8 @@ mod tests {
             width: 10,
             height: 20,
             luma: vec![0.3; 10 * 20],
-            normal_x: vec![0.0; 10 * 20],
-            normal_y: vec![0.0; 10 * 20],
+            direction_cos2: vec![0.0; 10 * 20],
+            direction_sin2: vec![0.0; 10 * 20],
             edge_strength: vec![0.0; 10 * 20],
         };
         assert_eq!(
