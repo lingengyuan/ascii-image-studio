@@ -621,6 +621,7 @@ def write_baseline_doc(
         "",
         "- 渲染图是字符覆盖的栅格化结果，绝对指标不代表照片级质量，只能在同一套样张、宽度和参数下比较。",
         "- 未模糊的 SSIM、Sobel corr、DoG corr 受字符栅格纹理主导，数值接近 0；判断结构改善主要看 SSIM@σ5、FSIM@σ5 和密度误差。",
+        "- `--refine` 的验收口径以 SSIM@σ5、FSIM@σ5 和 density MAE 为准；未模糊 SSIM/FSIM 仅作回归调试，允许微小下降。",
         "- 只实现灰度 FSIM，没有实现彩色 FSIMc；彩色信息不进入指标。",
         "- 卷积边界仍可能与 MATLAB 逐位不同：MATLAB `conv2` 的边界与 OpenCV 零填充在边界像素上可能相差 1 像素；本脚本的 FSIM 用 full 卷积后按 MATLAB `same` 规则裁剪，仍不保证与 MATLAB 逐位一致。",
         "- 预处理图为 8-bit，量化误差已计入指标。",
