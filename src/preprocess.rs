@@ -11,13 +11,17 @@ const BT601_R: f32 = 0.299;
 const BT601_G: f32 = 0.587;
 const BT601_B: f32 = 0.114;
 const SIGNAL_EPSILON: f32 = 1.0e-6;
-const DIRECTION_SMOOTH_SIGMA: f32 = 2.0;
+// 两次 radius 2 箱式模糊的方差是 4，近似 sigma 2 的高斯；滑动窗口不逐像素乘核。
+const DIRECTION_SMOOTH_BOX_RADIUS: u32 = 2;
+const DIRECTION_SMOOTH_BOX_PASSES: usize = 2;
 const DIRECTION_SMOOTH_MIN_COHERENCE: f32 = 0.25;
 const DIRECTION_WEIGHT_EPSILON: f32 = 1.0e-4;
 
 pub struct ProcessedImage {
     pub width: u32,
     pub height: u32,
+    /// DoG 上原始 Sobel 幅值的最大值，用来把归一化强度还原成绝对强度。
+    pub edge_scale: f32,
     luma: Vec<f32>,
     /// 合成到黑底后的原始亮度，只用于前景明度，不参与匹配。
     display_luma: Vec<f32>,
@@ -30,6 +34,7 @@ pub struct ProcessedImage {
 pub struct WorkImage {
     pub width: u32,
     pub height: u32,
+    pub edge_scale: f32,
     pub luma: Vec<f32>,
     /// 双角度分量（cos 2θ），插值不会因 180° 反相而抵消。
     pub direction_cos2: Vec<f32>,
@@ -96,11 +101,11 @@ pub fn preprocess(
 
     apply_tone_map(&mut luma, width, height, tone_map, contrast)?;
 
-    let (normal_x, normal_y, edge_strength, signed_dog) = if edge_weight > 0.0 {
+    let (normal_x, normal_y, edge_strength, signed_dog, edge_scale) = if edge_weight > 0.0 {
         edge_maps(&luma, width, height)
     } else {
         let zeroes = vec![0.0; pixel_count];
-        (zeroes.clone(), zeroes.clone(), zeroes.clone(), zeroes)
+        (zeroes.clone(), zeroes.clone(), zeroes.clone(), zeroes, 0.0)
     };
 
     if edge_weight > 0.0 {
@@ -110,6 +115,7 @@ pub fn preprocess(
     Ok(ProcessedImage {
         width,
         height,
+        edge_scale,
         luma,
         display_luma,
         normal_x,
@@ -123,7 +129,11 @@ fn composite_on_black(channel: u8, alpha: u16) -> u8 {
     ((u16::from(channel) * alpha + 127) / 255) as u8
 }
 
-fn edge_maps(luma: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+fn edge_maps(
+    luma: &[f32],
+    width: u32,
+    height: u32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, f32) {
     let narrow = gaussian_blur(luma, width, height, 0.7);
     let wide = gaussian_blur(luma, width, height, 1.6);
     let dog: Vec<f32> = narrow
@@ -172,7 +182,7 @@ fn edge_maps(luma: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<f32>, Vec<
 
     smooth_edge_directions(&mut normal_x, &mut normal_y, &magnitudes, width, height);
 
-    (normal_x, normal_y, magnitudes, dog)
+    (normal_x, normal_y, magnitudes, dog, max_magnitude)
 }
 
 /// 边缘方向以 180° 为周期，直接平均会让相对的两侧互相抵消。
@@ -197,9 +207,9 @@ fn smooth_edge_directions(
         .map(|((nx, ny), weight)| 2.0 * nx * ny * weight)
         .collect();
 
-    let smooth_cos = gaussian_blur(&cos_double, width, height, DIRECTION_SMOOTH_SIGMA);
-    let smooth_sin = gaussian_blur(&sin_double, width, height, DIRECTION_SMOOTH_SIGMA);
-    let smooth_weight = gaussian_blur(edge_strength, width, height, DIRECTION_SMOOTH_SIGMA);
+    let smooth_cos = direction_smooth(&cos_double, width, height);
+    let smooth_sin = direction_smooth(&sin_double, width, height);
+    let smooth_weight = direction_smooth(edge_strength, width, height);
 
     for index in 0..normal_x.len() {
         if smooth_weight[index] <= DIRECTION_WEIGHT_EPSILON {
@@ -261,6 +271,74 @@ fn gaussian_blur(values: &[f32], width: u32, height: u32, sigma: f32) -> Vec<f32
                 sum += sample_clamped(&horizontal, width, height, x, y + offset) * weight;
             }
             output[y as usize * width as usize + x as usize] = sum;
+        }
+    }
+    output
+}
+
+fn direction_smooth(values: &[f32], width: u32, height: u32) -> Vec<f32> {
+    let mut blurred = box_blur(values, width, height, DIRECTION_SMOOTH_BOX_RADIUS);
+    for _ in 1..DIRECTION_SMOOTH_BOX_PASSES {
+        blurred = box_blur(&blurred, width, height, DIRECTION_SMOOTH_BOX_RADIUS);
+    }
+    blurred
+}
+
+/// 边缘按复制处理；每行只做一次入窗求和，之后滑动加减。
+/// 竖直方向按列块处理，避免逐列跨行读取时的缓存抖动。
+fn box_blur(values: &[f32], width: u32, height: u32, radius: u32) -> Vec<f32> {
+    let radius = radius as isize;
+    let width = width as usize;
+    let height = height as usize;
+    let inv_window = 1.0 / (radius * 2 + 1) as f32;
+    let clamp_x = |x: isize| x.clamp(0, width as isize - 1) as usize;
+    let clamp_y = |y: isize| y.clamp(0, height as isize - 1) as usize;
+    let leave_x: Vec<usize> = (0..width).map(|x| clamp_x(x as isize - radius)).collect();
+    let enter_x: Vec<usize> = (0..width)
+        .map(|x| clamp_x(x as isize + radius + 1))
+        .collect();
+    let leave_y: Vec<usize> = (0..height).map(|y| clamp_y(y as isize - radius)).collect();
+    let enter_y: Vec<usize> = (0..height)
+        .map(|y| clamp_y(y as isize + radius + 1))
+        .collect();
+
+    let mut horizontal = vec![0.0; values.len()];
+    for y in 0..height {
+        let row = y * width;
+        let mut sum = 0.0;
+        for offset in -radius..=radius {
+            sum += values[row + clamp_x(offset)];
+        }
+        for x in 0..width {
+            horizontal[row + x] = sum * inv_window;
+            sum += values[row + enter_x[x]] - values[row + leave_x[x]];
+        }
+    }
+
+    const COLUMN_BLOCK: usize = 16;
+    let mut output = vec![0.0; values.len()];
+    for x0 in (0..width).step_by(COLUMN_BLOCK) {
+        let x1 = (x0 + COLUMN_BLOCK).min(width);
+        let mut sums = [0.0_f32; COLUMN_BLOCK];
+        for (lane, sum) in sums[..x1 - x0].iter_mut().enumerate() {
+            let x = x0 + lane;
+            let mut window_sum = 0.0;
+            for offset in -radius..=radius {
+                window_sum += horizontal[clamp_y(offset) * width + x];
+            }
+            *sum = window_sum;
+        }
+        for y in 0..height {
+            let out_row = y * width + x0;
+            let enter_row = enter_y[y] * width + x0;
+            let leave_row = leave_y[y] * width + x0;
+            let out = &mut output[out_row..out_row + (x1 - x0)];
+            let enter = &horizontal[enter_row..enter_row + (x1 - x0)];
+            let leave = &horizontal[leave_row..leave_row + (x1 - x0)];
+            for lane in 0..x1 - x0 {
+                out[lane] = sums[lane] * inv_window;
+                sums[lane] += enter[lane] - leave[lane];
+            }
         }
     }
     output
@@ -360,6 +438,7 @@ impl ProcessedImage {
         Ok(WorkImage {
             width,
             height,
+            edge_scale: self.edge_scale,
             luma,
             direction_cos2: direction_cos2_out,
             direction_sin2: direction_sin2_out,
@@ -455,7 +534,10 @@ mod tests {
 
     use crate::tone::ToneMap;
 
-    use super::{ProcessedImage, gaussian_blur, preprocess, smooth_edge_directions};
+    use super::{
+        ProcessedImage, box_blur, direction_smooth, gaussian_blur, preprocess,
+        smooth_edge_directions,
+    };
 
     #[test]
     fn bt601_red_and_green_have_expected_luminance() {
@@ -485,6 +567,21 @@ mod tests {
         let values = vec![0.42; 7 * 5];
         let blurred = gaussian_blur(&values, 7, 5, 1.6);
         assert!(blurred.iter().all(|value| (*value - 0.42).abs() < 1.0e-5));
+    }
+
+    #[test]
+    fn two_pass_box_blur_preserves_constant_signal_and_spreads_impulse() {
+        let values = vec![0.42; 7 * 5];
+        let blurred = direction_smooth(&values, 7, 5);
+        assert!(blurred.iter().all(|value| (*value - 0.42).abs() < 1.0e-5));
+
+        let mut impulse = vec![0.0; 9];
+        impulse[4] = 1.0;
+        let spread = box_blur(&impulse, 9, 1, 2);
+        assert!((spread.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+        assert!((spread[2] - spread[4]).abs() < 1.0e-6);
+        assert!(spread[2] > 0.0);
+        assert_eq!(spread[0], 0.0);
     }
 
     /// 24 个交替法向的朴素平均恰好为零（25 个像素无法对半分，余下一个弱像素）；
@@ -549,6 +646,7 @@ mod tests {
         let processed = ProcessedImage {
             width: 2,
             height: 1,
+            edge_scale: 1.0,
             luma: vec![0.5; 2],
             display_luma: vec![0.5; 2],
             normal_x: vec![normal_x, normal_x],

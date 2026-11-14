@@ -12,6 +12,21 @@ const DIRECTION_PRIOR_WEIGHT: f32 = 0.04;
 const DIRECTION_PRIOR_RAMP_START: f32 = 0.35;
 const DIRECTION_PRIOR_RAMP_END: f32 = 0.70;
 const DIRECTION_MIN_COHERENCE: f32 = 0.25;
+/// 归一化强度会掩盖低对比度图，这里再用原始 Sobel 幅值卡一次绝对下限。
+/// 实测固定样张的扩散活跃单元从 0.51 起；12 张 holdout 最高 0.564，取 0.57
+/// 让 holdout 全部回退到各向同性 FS，固定样张只关掉 0.51 到 0.57 的窄带。
+const DIRECTION_MIN_ABSOLUTE_EDGE: f32 = 0.57;
+
+// 扩散斜坡起点低于选字先验，让中等强度边缘也参与；上端沿用先验。
+const DIFFUSION_RAMP_START: f32 = 0.29;
+const DIFFUSION_RAMP_END: f32 = DIRECTION_PRIOR_RAMP_END;
+const FLOYD_STEINBERG_WEIGHTS: [f32; 4] = [7.0 / 16.0, 3.0 / 16.0, 5.0 / 16.0, 1.0 / 16.0];
+const FLOYD_STEINBERG_OFFSETS: [(f32, f32); 4] = [
+    (CELL_WIDTH as f32, 0.0),
+    (-(CELL_WIDTH as f32), CELL_HEIGHT as f32),
+    (0.0, CELL_HEIGHT as f32),
+    (CELL_WIDTH as f32, CELL_HEIGHT as f32),
+];
 
 const HORIZONTAL_CANDIDATES: &[char] = &['-', '_', '~'];
 const BACKSLASH_CANDIDATES: &[char] = &['\\', '\'', '`', ','];
@@ -108,13 +123,14 @@ fn match_ascii_parallel(
         .map(|row| {
             (0..config.cols)
                 .map(|col| {
+                    let direction = cell_direction(work, config, col, row);
                     build_ascii_cell(
                         image,
                         atlas,
                         config,
-                        work,
                         CellPosition { col, row, rows },
                         enhanced_samples(work, col, row, config.dir_crunch),
+                        direction,
                     )
                 })
                 .collect()
@@ -138,6 +154,7 @@ fn match_ascii_serial(
         for col in 0..config.cols {
             let index = cell_index(config.cols, col, row);
             // 与无抖动路径同一份方向增强结果；抖动只改密度，不改方向。
+            let direction = cell_direction(work, config, col, row);
             let enhanced = enhanced_samples(work, col, row, config.dir_crunch);
             let target_density = (shape_density(enhanced) + errors[index]).clamp(0.0, 1.0);
             let adjusted = scale_to_density(enhanced, target_density);
@@ -145,9 +162,9 @@ fn match_ascii_serial(
                 image,
                 atlas,
                 config,
-                work,
                 CellPosition { col, row, rows },
                 adjusted,
+                direction,
             );
             diffuse_scalar_error(
                 config.cols,
@@ -155,6 +172,7 @@ fn match_ascii_serial(
                 col,
                 row,
                 target_density - cell.density,
+                diffusion_weights(direction),
                 &mut errors,
             );
             cells.push(cell);
@@ -168,16 +186,15 @@ fn build_ascii_cell(
     image: &ProcessedImage,
     atlas: &FontAtlas,
     config: &MatchConfig,
-    work: &WorkImage,
     position: CellPosition,
     enhanced: [f32; 6],
+    direction: Option<CellDirection>,
 ) -> AsciiCell {
-    let prior = if config.edge_weight > 0.0 {
-        direction_prior(work, position.col, position.row)
-    } else {
-        None
-    };
-    let glyph = nearest_glyph(atlas.ascii(), enhanced, prior.as_ref());
+    let glyph = nearest_glyph(
+        atlas.ascii(),
+        enhanced,
+        direction_prior_from(direction.map(|direction| direction.edge)).as_ref(),
+    );
 
     AsciiCell {
         ch: glyph.ch,
@@ -361,16 +378,45 @@ fn mean_region(work: &WorkImage, bounds: (u32, u32, u32, u32)) -> f32 {
     sum / count.max(1) as f32
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct EdgeDirection {
     normal_x: f32,
     normal_y: f32,
     strength: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CellDirection {
+    edge: EdgeDirection,
+    /// 绝对强度过门限才允许结构感知扩散；先验仍按归一化强度，与 HEAD 一致。
+    diffuses: bool,
+}
+
+/// edge_weight 为 0 时不算方向，保持无先验、无扩散偏置的路径。
+fn cell_direction(
+    work: &WorkImage,
+    config: &MatchConfig,
+    col: u32,
+    row: u32,
+) -> Option<CellDirection> {
+    if config.edge_weight <= 0.0 {
+        return None;
+    }
+    let edge = edge_direction_components(work, col, row)?;
+    Some(CellDirection {
+        edge,
+        diffuses: absolute_edge_is_real(work, edge.strength),
+    })
+}
+
+/// 低对比度图的归一化强度仍可能接近 1，用原始 Sobel 幅值判断边缘是否真实。
+fn absolute_edge_is_real(work: &WorkImage, strength: f32) -> bool {
+    strength * work.edge_scale >= DIRECTION_MIN_ABSOLUTE_EDGE
+}
+
 /// 单元内也按双角度聚合。相干度是双角度能量与边缘强度之和的比值：
 /// 只有方向一致时它才接近 1，方向互相抵消的低相干单元没有先验。
-fn edge_direction(work: &WorkImage, col: u32, row: u32) -> Option<EdgeDirection> {
+fn edge_direction_components(work: &WorkImage, col: u32, row: u32) -> Option<EdgeDirection> {
     let x0 = col * CELL_WIDTH;
     let y0 = row * CELL_HEIGHT;
     let mut sum_cos = 0.0;
@@ -408,8 +454,8 @@ struct DirectionPrior {
 }
 
 /// 方向先验只软性加罚：强边缘才生效，弱边缘仍由 6D 形状决定。
-fn direction_prior(work: &WorkImage, col: u32, row: u32) -> Option<DirectionPrior> {
-    let direction = edge_direction(work, col, row)?;
+fn direction_prior_from(direction: Option<EdgeDirection>) -> Option<DirectionPrior> {
+    let direction = direction?;
     let ramp = ((direction.strength - DIRECTION_PRIOR_RAMP_START)
         / (DIRECTION_PRIOR_RAMP_END - DIRECTION_PRIOR_RAMP_START))
         .clamp(0.0, 1.0);
@@ -507,17 +553,50 @@ fn cell_index(cols: u32, col: u32, row: u32) -> usize {
     row as usize * cols as usize + col as usize
 }
 
-fn diffuse_scalar_error(cols: u32, rows: u32, col: u32, row: u32, error: f32, errors: &mut [f32]) {
+/// 强边缘上把 FS 误差沿边缘扩散：垂直边缘的右邻权重趋近 0，水平边缘的下邻权重趋近 0。
+fn diffusion_weights(direction: Option<CellDirection>) -> [f32; 4] {
+    let Some(direction) = direction.filter(|direction| direction.diffuses) else {
+        return FLOYD_STEINBERG_WEIGHTS;
+    };
+    let edge = direction.edge;
+    let ramp = ((edge.strength - DIFFUSION_RAMP_START)
+        / (DIFFUSION_RAMP_END - DIFFUSION_RAMP_START))
+        .clamp(0.0, 1.0);
+    if ramp <= 0.0 {
+        return FLOYD_STEINBERG_WEIGHTS;
+    }
+    let mut weights = FLOYD_STEINBERG_WEIGHTS;
+    for (weight, (dx, dy)) in weights.iter_mut().zip(FLOYD_STEINBERG_OFFSETS) {
+        let length = dx.hypot(dy);
+        let along = 1.0 - ((dx * edge.normal_x + dy * edge.normal_y) / length).powi(2);
+        *weight *= (1.0 - ramp) + ramp * along;
+    }
+    let sum: f32 = weights.iter().sum();
+    if sum <= 1.0e-6 {
+        return FLOYD_STEINBERG_WEIGHTS;
+    }
+    weights.map(|weight| weight / sum)
+}
+
+fn diffuse_scalar_error(
+    cols: u32,
+    rows: u32,
+    col: u32,
+    row: u32,
+    error: f32,
+    weights: [f32; 4],
+    errors: &mut [f32],
+) {
     if col + 1 < cols {
-        errors[cell_index(cols, col + 1, row)] += error * 7.0 / 16.0;
+        errors[cell_index(cols, col + 1, row)] += error * weights[0];
     }
     if row + 1 < rows {
         if col > 0 {
-            errors[cell_index(cols, col - 1, row + 1)] += error * 3.0 / 16.0;
+            errors[cell_index(cols, col - 1, row + 1)] += error * weights[1];
         }
-        errors[cell_index(cols, col, row + 1)] += error * 5.0 / 16.0;
+        errors[cell_index(cols, col, row + 1)] += error * weights[2];
         if col + 1 < cols {
-            errors[cell_index(cols, col + 1, row + 1)] += error / 16.0;
+            errors[cell_index(cols, col + 1, row + 1)] += error * weights[3];
         }
     }
 }
@@ -527,12 +606,13 @@ mod tests {
     use image::{DynamicImage, Rgb, RgbImage};
 
     use super::{
-        BACKSLASH_CANDIDATES, CellPosition, DIRECTION_PRIOR_WEIGHT, DirectionPrior,
+        BACKSLASH_CANDIDATES, CellDirection, CellPosition, DIFFUSION_RAMP_START,
+        DIRECTION_PRIOR_WEIGHT, DirectionPrior, EdgeDirection, FLOYD_STEINBERG_WEIGHTS,
         HORIZONTAL_CANDIDATES, MatchConfig, SLASH_CANDIDATES, VERTICAL_CANDIDATES,
-        build_ascii_cell, diffuse_scalar_error, dir_crunch, direction_prior, directional_ascii,
-        directional_candidates, distance_squared, edge_direction, enhanced_samples,
-        external_bounds, external_samples, internal_samples, match_image, mean_region,
-        nearest_glyph, output_rows, scale_to_density,
+        build_ascii_cell, cell_direction, diffuse_scalar_error, diffusion_weights, dir_crunch,
+        direction_prior_from, directional_ascii, directional_candidates, distance_squared,
+        enhanced_samples, external_bounds, external_samples, internal_samples, match_image,
+        mean_region, nearest_glyph, output_rows, scale_to_density,
     };
     use crate::font_atlas::FontAtlas;
     use crate::preprocess::{
@@ -581,6 +661,18 @@ mod tests {
         DynamicImage::ImageRgb8(image)
     }
 
+    /// 2 像素亮暗交替的竖条，每个工作单元都横跨多条边缘。
+    fn vertical_stripes(width: u32, height: u32) -> DynamicImage {
+        let mut image = RgbImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let value = if (x / 2) % 2 == 0 { 235 } else { 20 };
+                image.put_pixel(x, y, Rgb([value, value, value]));
+            }
+        }
+        DynamicImage::ImageRgb8(image)
+    }
+
     /// 只按顺序拼装现有元件：先 crunch，再等比缩放模长，最后选字。
     fn reference_serial_chars(
         image: &ProcessedImage,
@@ -596,15 +688,16 @@ mod tests {
         for row in 0..rows {
             for col in 0..config.cols {
                 let index = (row * config.cols + col) as usize;
+                let direction = cell_direction(&work, config, col, row);
                 let enhanced = enhanced_samples(&work, col, row, config.dir_crunch);
                 let target = (shape_density(enhanced) + errors[index]).clamp(0.0, 1.0);
                 let cell = build_ascii_cell(
                     image,
                     atlas,
                     config,
-                    &work,
                     CellPosition { col, row, rows },
                     scale_to_density(enhanced, target),
+                    direction,
                 );
                 diffuse_scalar_error(
                     config.cols,
@@ -612,6 +705,7 @@ mod tests {
                     col,
                     row,
                     target - cell.density,
+                    diffusion_weights(direction),
                     &mut errors,
                 );
                 chars.push(cell.ch);
@@ -666,6 +760,61 @@ mod tests {
     }
 
     #[test]
+    fn diffusion_weights_fall_back_to_floyd_steinberg() {
+        let base = [7.0 / 16.0, 3.0 / 16.0, 5.0 / 16.0, 1.0 / 16.0];
+        assert_eq!(diffusion_weights(None), base);
+        let weak = CellDirection {
+            edge: EdgeDirection {
+                normal_x: 1.0,
+                normal_y: 0.0,
+                strength: DIFFUSION_RAMP_START * 0.5,
+            },
+            diffuses: true,
+        };
+        assert_eq!(diffusion_weights(Some(weak)), base);
+
+        let gated = CellDirection {
+            edge: EdgeDirection {
+                normal_x: 1.0,
+                normal_y: 0.0,
+                strength: 1.0,
+            },
+            diffuses: false,
+        };
+        assert_eq!(diffusion_weights(Some(gated)), base);
+    }
+
+    #[test]
+    fn diffusion_weights_follow_a_vertical_edge() {
+        let weights = diffusion_weights(Some(CellDirection {
+            edge: EdgeDirection {
+                normal_x: 1.0,
+                normal_y: 0.0,
+                strength: 1.0,
+            },
+            diffuses: true,
+        }));
+        assert!(weights[0] < 1.0e-6, "right={}", weights[0]);
+        assert!(weights[2] > 5.0 / 16.0, "bottom={}", weights[2]);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn diffusion_weights_follow_a_horizontal_edge() {
+        let weights = diffusion_weights(Some(CellDirection {
+            edge: EdgeDirection {
+                normal_x: 0.0,
+                normal_y: 1.0,
+                strength: 1.0,
+            },
+            diffuses: true,
+        }));
+        assert!(weights[2] < 1.0e-6, "bottom={}", weights[2]);
+        assert!(weights[0] > 7.0 / 16.0, "right={}", weights[0]);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
     fn zero_weight_prior_does_not_change_the_chosen_glyph() {
         let atlas = FontAtlas::load().unwrap();
         let prior = DirectionPrior {
@@ -697,6 +846,7 @@ mod tests {
         WorkImage {
             width: CELL_WIDTH,
             height: CELL_HEIGHT,
+            edge_scale: 1.0,
             luma: vec![0.0; pixel_count],
             direction_cos2: vec![direction_cos2; pixel_count],
             direction_sin2: vec![0.0; pixel_count],
@@ -709,26 +859,49 @@ mod tests {
         let mut incoherent = uniform_work_cell(1.0, 1.0);
         let half = incoherent.direction_cos2.len() / 2;
         incoherent.direction_cos2[half..].fill(-1.0);
-        assert!(edge_direction(&incoherent, 0, 0).is_none());
-        assert!(direction_prior(&incoherent, 0, 0).is_none());
+        let cell = cell_direction(&incoherent, &config(false), 0, 0);
+        assert!(cell.is_none());
+        assert!(direction_prior_from(cell.map(|cell| cell.edge)).is_none());
 
         // 60/40 反相的绝对和不为零，旧的绝对和检查会误判为有方向。
         let mut mostly_positive = uniform_work_cell(1.0, 1.0);
         let sixty_percent = mostly_positive.direction_cos2.len() * 3 / 5;
         mostly_positive.direction_cos2[sixty_percent..].fill(-1.0);
-        assert!(edge_direction(&mostly_positive, 0, 0).is_none());
-        assert!(direction_prior(&mostly_positive, 0, 0).is_none());
+        assert!(cell_direction(&mostly_positive, &config(false), 0, 0).is_none());
 
         let coherent = uniform_work_cell(1.0, 1.0);
-        assert!(edge_direction(&coherent, 0, 0).is_some());
-        assert!(direction_prior(&coherent, 0, 0).is_some());
+        let cell = cell_direction(&coherent, &config(false), 0, 0);
+        assert!(cell.is_some());
+        assert!(direction_prior_from(cell.map(|cell| cell.edge)).is_some());
+    }
+
+    #[test]
+    fn low_contrast_cell_does_not_diffuse() {
+        let mut low_contrast = uniform_work_cell(1.0, 1.0);
+        low_contrast.edge_scale = 0.005;
+        let cell = cell_direction(&low_contrast, &config(false), 0, 0)
+            .expect("归一化强度足够，仍应得到方向");
+        assert!(!cell.diffuses);
+        assert_eq!(
+            diffusion_weights(Some(cell)),
+            FLOYD_STEINBERG_WEIGHTS,
+            "低对比度单元应回退到各向同性 FS"
+        );
+        // 先验只按归一化强度计算，低对比度图仍与 HEAD 一样获得先验。
+        assert!(direction_prior_from(Some(cell.edge)).is_some());
+
+        let normal_contrast = uniform_work_cell(1.0, 1.0);
+        let cell =
+            cell_direction(&normal_contrast, &config(false), 0, 0).expect("正常对比度应得到方向");
+        assert!(cell.diffuses);
     }
 
     #[test]
     fn real_weight_prior_allows_non_candidate_shape_to_win() {
         let atlas = FontAtlas::load().unwrap();
         let work = uniform_work_cell(1.0, 1.0);
-        let prior = direction_prior(&work, 0, 0).expect("coherent cell has a prior");
+        let cell = cell_direction(&work, &config(false), 0, 0).expect("相干单元应有方向");
+        let prior = direction_prior_from(Some(cell.edge)).expect("相干单元应有先验");
         assert_eq!(prior.candidates, VERTICAL_CANDIDATES);
         assert!(
             (prior.weight - DIRECTION_PRIOR_WEIGHT).abs() < 1.0e-6,
@@ -755,6 +928,7 @@ mod tests {
         let work = WorkImage {
             width: 10,
             height: 20,
+            edge_scale: 1.0,
             luma: vec![0.5; 200],
             direction_cos2: vec![1.0; 200],
             direction_sin2: vec![0.0; 200],
@@ -775,17 +949,18 @@ mod tests {
             .expect("atlas contains A")
             .shape_vec;
 
+        let direction = cell_direction(&work, &config, 0, 0);
         let cell = build_ascii_cell(
             &processed,
             &atlas,
             &config,
-            &work,
             CellPosition {
                 col: 0,
                 row: 0,
                 rows: 1,
             },
             target,
+            direction,
         );
 
         assert_eq!(cell.ch, 'A');
@@ -796,6 +971,7 @@ mod tests {
         let mut work = WorkImage {
             width: 30,
             height: 40,
+            edge_scale: 1.0,
             luma: vec![0.0; 30 * 40],
             direction_cos2: vec![0.0; 30 * 40],
             direction_sin2: vec![0.0; 30 * 40],
@@ -813,6 +989,7 @@ mod tests {
         let edge_work = WorkImage {
             width: 10,
             height: 20,
+            edge_scale: 1.0,
             luma: vec![0.3; 10 * 20],
             direction_cos2: vec![0.0; 10 * 20],
             direction_sin2: vec![0.0; 10 * 20],
@@ -982,6 +1159,39 @@ mod tests {
         let art = match_image(&processed, &atlas, &conf).unwrap();
         let actual: Vec<char> = art.cells.iter().map(|cell| cell.ch).collect();
         assert_eq!(actual, reference_serial_chars(&processed, &atlas, &conf));
+    }
+
+    #[test]
+    fn serial_dither_uses_structure_aware_weights() {
+        let image = vertical_stripes(80, 40);
+        let processed = preprocess(&image, 1.0, 0.25, ToneMap::Global).unwrap();
+        let atlas = FontAtlas::load().unwrap();
+        let conf = MatchConfig {
+            cols: 8,
+            dir_crunch: 2.5,
+            edge_weight: 0.25,
+            dither: true,
+            color: false,
+            braille: false,
+        };
+
+        let art = match_image(&processed, &atlas, &conf).unwrap();
+        let actual: Vec<char> = art.cells.iter().map(|cell| cell.ch).collect();
+        assert_eq!(actual, reference_serial_chars(&processed, &atlas, &conf));
+
+        let rows = output_rows(conf.cols, processed.width, processed.height).unwrap();
+        let work = processed
+            .resample(conf.cols * CELL_WIDTH, rows * CELL_HEIGHT)
+            .unwrap();
+        let anisotropic_cells = (0..rows)
+            .flat_map(|row| (0..conf.cols).map(move |col| (col, row)))
+            .filter(|&(col, row)| {
+                cell_direction(&work, &conf, col, row).is_some_and(|direction| {
+                    diffusion_weights(Some(direction)) != FLOYD_STEINBERG_WEIGHTS
+                })
+            })
+            .count();
+        assert!(anisotropic_cells > 0, "竖条纹没有触发结构感知扩散");
     }
 
     #[test]
