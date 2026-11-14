@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, bail};
 use fontdue::{Font, FontSettings};
 
+use crate::aiss;
 use crate::preprocess::{CELL_HEIGHT, CELL_WIDTH, cell_region_bounds};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.ttf");
@@ -19,6 +20,8 @@ pub struct CharGlyph {
 pub struct FontAtlas {
     ascii: Vec<CharGlyph>,
     braille_bitmaps: Vec<Arc<[u8]>>,
+    /// AISS 描述子只在首次使用时构建，plain、dither、refine、braille 路径不付这份成本。
+    aiss_descriptors: OnceLock<Vec<Vec<f32>>>,
 }
 
 pub const BRAILLE_LAYOUT: [(usize, usize); 8] = [
@@ -65,11 +68,27 @@ impl FontAtlas {
         Ok(Self {
             ascii,
             braille_bitmaps,
+            aiss_descriptors: OnceLock::new(),
         })
     }
 
     pub fn ascii(&self) -> &[CharGlyph] {
         &self.ascii
+    }
+
+    /// 与 `ascii` 下标一一对应的 AISS 描述子，首次调用时才计算。
+    pub fn aiss_descriptors(&self) -> &[Vec<f32>] {
+        self.aiss_descriptors.get_or_init(|| {
+            self.ascii
+                .iter()
+                .map(|glyph| aiss::glyph_descriptor(&glyph.bitmap))
+                .collect()
+        })
+    }
+
+    #[cfg(test)]
+    fn aiss_descriptors_ready(&self) -> bool {
+        self.aiss_descriptors.get().is_some()
     }
 
     pub fn ascii_bitmap(&self, ch: char) -> Arc<[u8]> {
@@ -197,6 +216,7 @@ pub fn render_braille_bitmap(bits: u8) -> [u8; 200] {
 #[cfg(test)]
 mod tests {
     use super::{BRAILLE_LAYOUT, FontAtlas, braille_char, render_braille_bitmap};
+    use crate::aiss::glyph_descriptor;
     use crate::preprocess::{CELL_HEIGHT, CELL_WIDTH};
 
     #[test]
@@ -239,6 +259,17 @@ mod tests {
         assert_ne!(slash.shape_vec, underscore.shape_vec);
         assert_ne!(at.shape_vec, slash.shape_vec);
         assert!(at.density > slash.density.min(underscore.density));
+    }
+
+    #[test]
+    fn aiss_descriptors_are_built_on_first_use_and_match_the_bitmaps() {
+        let atlas = FontAtlas::load().unwrap();
+        assert!(!atlas.aiss_descriptors_ready());
+        let index = ('D' as usize) - 0x20;
+        let expected = glyph_descriptor(&atlas.ascii()[index].bitmap);
+        assert!(!atlas.aiss_descriptors_ready());
+        assert_eq!(atlas.aiss_descriptors()[index], expected);
+        assert!(atlas.aiss_descriptors_ready());
     }
 
     #[test]

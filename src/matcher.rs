@@ -3,11 +3,14 @@ use std::sync::Arc;
 use anyhow::{Result, ensure};
 use rayon::prelude::*;
 
+use crate::aiss;
 use crate::font_atlas::{BRAILLE_BAYER, BRAILLE_LAYOUT, CharGlyph, FontAtlas, braille_char};
 use crate::preprocess::{
     CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, color_luma,
     shape_density,
 };
+
+const CELL_PIXELS: usize = (CELL_WIDTH * CELL_HEIGHT) as usize;
 
 const DIRECTION_PRIOR_WEIGHT: f32 = 0.04;
 const DIRECTION_PRIOR_RAMP_START: f32 = 0.35;
@@ -34,6 +37,18 @@ const REFINE_CANDIDATE_COUNT: usize = 5;
 const REFINE_HVS_WEIGHT: f32 = 15.0;
 const REFINE_MEAN_WEIGHT: f32 = 3.0;
 const REFINE_EDGE_WEIGHT: f32 = 1.0;
+
+/// AISS 只在 6D 前 10 名内重排，保留形状先验的初选。
+const AISS_CANDIDATE_COUNT: usize = 10;
+/// 0.1 到 0.4 的重排会压低固定样张的 FSIM@σ5。0.01 让 FSIM@σ5 近似持平
+/// （平均 -0.004%），模糊 SSIM 和 density MAE 5/5 改善。未参与调参的
+/// Hay Wain 样张上模糊 SSIM、density MAE 4/4 改善，FSIM@σ5 波动在 ±0.03% 内。
+const AISS_WEIGHT: f32 = 0.01;
+/// 门限用归一化前的平均 Sobel 幅值，低对比单元不会因为归一化而被放大。
+/// 满幅台阶（0→1）为 0.510，1/255 台阶为 0.002，2/255 为 0.004，取 0.005 都挡下。
+/// 固定样张的回退占比：portrait 0.7%、high-texture 2.6%、landscape 2.9%、
+/// low-contrast 6.0%、lineart 7.0%（其中大部分是空白边）。
+const AISS_MIN_CELL_EDGE: f32 = 0.005;
 /// 小权重把候选拉回本格目标均值；全局均值项仍防止整图漂移。
 const REFINE_DENSITY_WEIGHT: f32 = 0.20;
 const HVS_KERNEL: [f32; 3] = [0.25, 0.5, 0.25];
@@ -64,6 +79,7 @@ pub struct MatchConfig {
     pub edge_weight: f32,
     pub dither: bool,
     pub refine: bool,
+    pub aiss: bool,
     pub color: bool,
     pub braille: bool,
 }
@@ -117,6 +133,8 @@ pub fn match_image(
         match_ascii_serial(image, atlas, config, &work, rows, cell_count)
     } else if config.refine {
         match_ascii_refine(image, atlas, config, &work, rows, cell_count)
+    } else if config.aiss {
+        match_ascii_aiss(image, atlas, config, &work, rows)
     } else {
         match_ascii_parallel(image, atlas, config, &work, rows)?
     };
@@ -164,6 +182,86 @@ fn match_ascii_parallel(
         })
         .collect();
     Ok(rows_of_cells.into_iter().flatten().collect())
+}
+
+/// AISS 只重排 6D 前 10 名；空白或退化单元保持纯 6D 的首选。
+fn match_ascii_aiss(
+    image: &ProcessedImage,
+    atlas: &FontAtlas,
+    config: &MatchConfig,
+    work: &WorkImage,
+    rows: u32,
+) -> Vec<AsciiCell> {
+    let glyphs = atlas.ascii();
+    let descriptors = atlas.aiss_descriptors();
+    let rows_of_cells: Vec<Vec<AsciiCell>> = (0..rows)
+        .into_par_iter()
+        .map(|row| {
+            (0..config.cols)
+                .map(|col| {
+                    let direction = cell_direction(work, config, col, row);
+                    let enhanced = enhanced_samples(work, col, row, config.dir_crunch);
+                    let prior = direction_prior_from(direction.map(|direction| direction.edge));
+                    let candidates = top_glyph_candidates(
+                        glyphs,
+                        enhanced,
+                        prior.as_ref(),
+                        AISS_CANDIDATE_COUNT,
+                    );
+                    let glyph_index = match aiss_cell_descriptor(work, col, row) {
+                        Some(descriptor) => candidates
+                            .iter()
+                            .min_by(|(left_index, left_cost), (right_index, right_cost)| {
+                                let left = *left_cost
+                                    + AISS_WEIGHT
+                                        * aiss::l1_distance(&descriptor, &descriptors[*left_index]);
+                                let right = *right_cost
+                                    + AISS_WEIGHT
+                                        * aiss::l1_distance(
+                                            &descriptor,
+                                            &descriptors[*right_index],
+                                        );
+                                left.total_cmp(&right)
+                            })
+                            .map(|(index, _)| *index)
+                            .unwrap_or(candidates[0].0),
+                        None => candidates[0].0,
+                    };
+                    let glyph = &glyphs[glyph_index];
+                    AsciiCell {
+                        ch: glyph.ch,
+                        fg_color: foreground_color(image, config, CellPosition { col, row, rows }),
+                        density: shape_density(glyph.shape_vec),
+                        bitmap: glyph.bitmap.clone(),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    rows_of_cells.into_iter().flatten().collect()
+}
+
+/// 目标单元先走与字形相同的 10x20 边缘算子；绝对平均幅值低于门限时回退纯 6D。
+fn aiss_cell_descriptor(work: &WorkImage, col: u32, row: u32) -> Option<Vec<f32>> {
+    let luma = cell_luma(work, col, row);
+    let edges = aiss::cell_edges(&luma);
+    if edges.mean_magnitude < AISS_MIN_CELL_EDGE {
+        return None;
+    }
+    Some(aiss::descriptor_from_edges(&edges.edges))
+}
+
+fn cell_luma(work: &WorkImage, col: u32, row: u32) -> [f32; CELL_PIXELS] {
+    let x0 = col * CELL_WIDTH;
+    let y0 = row * CELL_HEIGHT;
+    let mut luma = [0.0_f32; CELL_PIXELS];
+    for y in 0..CELL_HEIGHT {
+        for x in 0..CELL_WIDTH {
+            luma[y as usize * CELL_WIDTH as usize + x as usize] =
+                work.luma[(y0 + y) as usize * work.width as usize + (x0 + x) as usize];
+        }
+    }
+    luma
 }
 
 fn match_ascii_serial(
@@ -227,7 +325,8 @@ fn match_ascii_refine(
             let direction = cell_direction(work, config, col, row);
             let enhanced = enhanced_samples(work, col, row, config.dir_crunch);
             let prior = direction_prior_from(direction.map(|direction| direction.edge));
-            let candidates = top_glyph_candidates(glyphs, enhanced, prior.as_ref());
+            let candidates =
+                top_glyph_candidates(glyphs, enhanced, prior.as_ref(), REFINE_CANDIDATE_COUNT);
             let fg_color = foreground_color(image, config, CellPosition { col, row, rows });
             let fg_luminance = color_luma(fg_color);
             let target = mean_region(
@@ -306,22 +405,23 @@ fn match_ascii_refine(
         .collect()
 }
 
-/// 按基代价升序保留前 5 个候选；相同代价按字表顺序，保证与 `nearest_glyph` 的首选一致。
+/// 按基代价升序保留前 `count` 个候选；相同代价按字表顺序，保证与 `nearest_glyph` 的首选一致。
 fn top_glyph_candidates(
     glyphs: &[CharGlyph],
     target: [f32; 6],
     prior: Option<&DirectionPrior>,
+    count: usize,
 ) -> Vec<(usize, f32)> {
-    let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(REFINE_CANDIDATE_COUNT);
+    let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(count);
     for (index, glyph) in glyphs.iter().enumerate() {
         let cost = glyph_cost(glyph, target, prior);
         let position = candidates
             .iter()
             .position(|(_, existing)| cost < *existing)
             .unwrap_or(candidates.len());
-        if position < REFINE_CANDIDATE_COUNT {
+        if position < count {
             candidates.insert(position, (index, cost));
-            if candidates.len() > REFINE_CANDIDATE_COUNT {
+            if candidates.len() > count {
                 candidates.pop();
             }
         }
@@ -988,11 +1088,11 @@ mod tests {
         HORIZONTAL_CANDIDATES, MatchConfig, MatchedArt, REFINE_CANDIDATE_COUNT,
         REFINE_DENSITY_WEIGHT, REFINE_EDGE_WEIGHT, REFINE_HVS_WEIGHT, REFINE_MEAN_WEIGHT,
         REFINE_NEIGHBORS, RefineCell, RefineGrid, SLASH_CANDIDATES, VERTICAL_CANDIDATES,
-        blur_cell_grid, build_ascii_cell, cell_direction, diffuse_scalar_error, diffusion_weights,
-        dir_crunch, direction_prior_from, directional_ascii, directional_candidates,
-        distance_squared, enhanced_samples, external_bounds, external_samples, internal_samples,
-        match_image, mean_region, nearest_glyph, output_rows, scale_to_density,
-        top_glyph_candidates,
+        aiss_cell_descriptor, blur_cell_grid, build_ascii_cell, cell_direction,
+        diffuse_scalar_error, diffusion_weights, dir_crunch, direction_prior_from,
+        directional_ascii, directional_candidates, distance_squared, enhanced_samples,
+        external_bounds, external_samples, internal_samples, match_image, mean_region,
+        nearest_glyph, output_rows, scale_to_density, top_glyph_candidates,
     };
     use crate::font_atlas::FontAtlas;
     use crate::preprocess::{
@@ -1019,6 +1119,7 @@ mod tests {
             edge_weight: 0.25,
             dither,
             refine: false,
+            aiss: false,
             color: false,
             braille: false,
         }
@@ -1027,6 +1128,13 @@ mod tests {
     fn refine_config() -> MatchConfig {
         MatchConfig {
             refine: true,
+            ..config(false)
+        }
+    }
+
+    fn aiss_config() -> MatchConfig {
+        MatchConfig {
+            aiss: true,
             ..config(false)
         }
     }
@@ -1344,6 +1452,7 @@ mod tests {
             edge_weight: 0.25,
             dither: false,
             refine: false,
+            aiss: false,
             color: false,
             braille: false,
         };
@@ -1451,7 +1560,7 @@ mod tests {
     fn top_glyph_candidates_start_with_the_best_and_keep_five() {
         let atlas = FontAtlas::load().unwrap();
         let target = [0.2, 0.8, 0.4, 0.1, 0.6, 0.3];
-        let candidates = top_glyph_candidates(atlas.ascii(), target, None);
+        let candidates = top_glyph_candidates(atlas.ascii(), target, None, REFINE_CANDIDATE_COUNT);
         assert_eq!(candidates.len(), REFINE_CANDIDATE_COUNT);
         assert_eq!(
             atlas.ascii()[candidates[0].0].ch,
@@ -1778,6 +1887,87 @@ mod tests {
     }
 
     #[test]
+    fn flat_cells_fall_back_to_plain_matching() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 40, Rgb([128, 128, 128])));
+        let processed = preprocess(&image, 1.0, 0.25, ToneMap::Global).unwrap();
+        let atlas = FontAtlas::load().unwrap();
+        let plain = match_image(&processed, &atlas, &config(false)).unwrap();
+        let aiss = match_image(&processed, &atlas, &aiss_config()).unwrap();
+        assert_eq!(ascii_chars(&plain), ascii_chars(&aiss));
+    }
+
+    #[test]
+    fn aiss_gate_uses_the_unified_cell_edge_map() {
+        // edge_strength 与 edge_scale 取反值，证明门限只看统一边缘图。
+        let mut step = uniform_work_cell(1.0, 0.0);
+        for y in 0..CELL_HEIGHT as usize {
+            for x in 0..CELL_WIDTH as usize {
+                step.luma[y * CELL_WIDTH as usize + x] = if x >= 5 { 1.0 } else { 0.0 };
+            }
+        }
+        assert!(aiss_cell_descriptor(&step, 0, 0).is_some());
+
+        let mut flat = uniform_work_cell(1.0, 1.0);
+        flat.luma.fill(0.5);
+        assert!(aiss_cell_descriptor(&flat, 0, 0).is_none());
+    }
+
+    /// 1/255、2/255 台阶是非空单元，但绝对能量不足，必须回退纯 6D。
+    #[test]
+    fn aiss_gate_falls_back_on_low_contrast_non_blank_cells() {
+        for (amplitude, expected) in [
+            (1.0 / 255.0, false),
+            (2.0 / 255.0, false),
+            (3.0 / 255.0, true),
+        ] {
+            let mut step = uniform_work_cell(1.0, 0.0);
+            for y in 0..CELL_HEIGHT as usize {
+                for x in 0..CELL_WIDTH as usize {
+                    step.luma[y * CELL_WIDTH as usize + x] = if x >= 5 { amplitude } else { 0.0 };
+                }
+            }
+            let edges = crate::aiss::cell_edges(&super::cell_luma(&step, 0, 0));
+            assert!(
+                edges.edges.iter().any(|value| *value > 0.0),
+                "amplitude={amplitude} 不是空白单元"
+            );
+            assert_eq!(
+                aiss_cell_descriptor(&step, 0, 0).is_some(),
+                expected,
+                "amplitude={amplitude} mean={}",
+                edges.mean_magnitude
+            );
+        }
+    }
+
+    #[test]
+    fn aiss_matching_is_deterministic_and_reranks_ambiguous_cells() {
+        let mut image = RgbImage::new(80, 40);
+        for y in 0..image.height() {
+            for x in 0..image.width() {
+                let value = if (x / 3 + y / 3) % 2 == 0 { 230 } else { 25 };
+                image.put_pixel(x, y, Rgb([value, value, value]));
+            }
+        }
+        let image = DynamicImage::ImageRgb8(image);
+        let processed = preprocess(&image, 1.0, 0.25, ToneMap::Clahe).unwrap();
+        let atlas = FontAtlas::load().unwrap();
+        let plain = match_image(&processed, &atlas, &config(false)).unwrap();
+        let first = match_image(&processed, &atlas, &aiss_config()).unwrap();
+        let second = match_image(&processed, &atlas, &aiss_config()).unwrap();
+
+        assert_eq!(ascii_chars(&first), ascii_chars(&second));
+        assert!(
+            plain
+                .cells
+                .iter()
+                .zip(&first.cells)
+                .any(|(left, right)| left.ch != right.ch),
+            "AISS 未在棋盘格上改变任何字符"
+        );
+    }
+
+    #[test]
     fn mid_gray_dither_keeps_average_error_in_shape_density_units() {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(32, 32, Rgb([128, 128, 128])));
         let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
@@ -1907,6 +2097,7 @@ mod tests {
             edge_weight: 0.25,
             dither: true,
             refine: false,
+            aiss: false,
             color: false,
             braille: false,
         };

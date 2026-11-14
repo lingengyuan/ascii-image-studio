@@ -1,3 +1,4 @@
+pub mod aiss;
 pub mod cli;
 pub mod font_atlas;
 pub mod matcher;

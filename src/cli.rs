@@ -49,6 +49,10 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["dither", "braille"])]
     pub refine: bool,
 
+    /// 用 AISS 边缘描述子重排 6D 候选；弱边缘或空白单元回退到纯 6D
+    #[arg(long, conflicts_with_all = ["dither", "braille", "refine"])]
+    pub aiss: bool,
+
     /// 保留原图高亮像素颜色
     #[arg(long)]
     pub color: bool,
@@ -143,6 +147,7 @@ mod tests {
         assert_eq!(cli.dir_crunch, 2.5);
         assert_eq!(cli.edge_weight, 0.25);
         assert!(!cli.refine);
+        assert!(!cli.aiss);
     }
 
     #[test]
@@ -151,6 +156,18 @@ mod tests {
         assert!(cli.refine);
         assert!(Cli::try_parse_from(["tool", "input.png", "--refine", "--dither"]).is_err());
         assert!(Cli::try_parse_from(["tool", "input.png", "--refine", "--braille"]).is_err());
+    }
+
+    #[test]
+    fn aiss_is_opt_in_and_conflicts_with_other_ascii_paths() {
+        let cli = Cli::try_parse_from(["tool", "input.png", "--aiss"]).unwrap();
+        assert!(cli.aiss);
+        for conflict in ["--dither", "--braille", "--refine"] {
+            assert!(
+                Cli::try_parse_from(["tool", "input.png", "--aiss", conflict]).is_err(),
+                "conflict={conflict}"
+            );
+        }
     }
 
     #[test]

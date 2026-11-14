@@ -526,6 +526,48 @@ fn cli_handles_single_row_and_single_column_inputs() {
 }
 
 #[test]
+fn cli_aiss_is_opt_in_deterministic_and_conflicts_with_other_ascii_modes() {
+    let temp = TempDir::new("aiss");
+    let input = temp.path("checker.png");
+    let mut image = RgbImage::new(80, 40);
+    for y in 0..image.height() {
+        for x in 0..image.width() {
+            let value = if (x / 3 + y / 3) % 2 == 0 { 230 } else { 25 };
+            image.put_pixel(x, y, Rgb([value, value, value]));
+        }
+    }
+    DynamicImage::ImageRgb8(image).save(&input).unwrap();
+
+    let plain = temp.path("plain.txt");
+    let first = temp.path("aiss-1.txt");
+    let second = temp.path("aiss-2.txt");
+    assert_success(&run(&[
+        path_text(&input),
+        "--width",
+        "16",
+        "--output",
+        path_text(&plain),
+    ]));
+    for path in [&first, &second] {
+        assert_success(&run(&[
+            path_text(&input),
+            "--width",
+            "16",
+            "--aiss",
+            "--output",
+            path_text(path),
+        ]));
+    }
+    assert_ne!(fs::read(&plain).unwrap(), fs::read(&first).unwrap());
+    assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+
+    for conflict in ["--dither", "--braille", "--refine"] {
+        let output = run(&[path_text(&input), "--aiss", conflict]);
+        assert_eq!(output.status.code(), Some(2), "conflict={conflict}");
+    }
+}
+
+#[test]
 fn cli_braille_dither_changes_uniform_gray_output() {
     let temp = TempDir::new("braille-dither");
     let input = temp.path("gray.png");

@@ -44,6 +44,7 @@ fn run(cli: Cli) -> Result<()> {
         edge_weight: cli.edge_weight,
         dither: cli.dither,
         refine: cli.refine,
+        aiss: cli.aiss,
         color: cli.color,
         braille: cli.braille,
     };
