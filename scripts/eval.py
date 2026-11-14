@@ -100,7 +100,7 @@ SAMPLES = [
     ROOT / "samples" / "high-texture.png",
     ROOT / "samples" / "low-contrast.png",
 ]
-MODES = [("plain", []), ("dither", ["--dither"])]
+MODES = [("plain", []), ("dither", ["--dither"]), ("refine", ["--refine"])]
 METRIC_KEYS = [
     "ssim",
     "ssim_hvs",
@@ -566,7 +566,7 @@ def write_baseline_doc(
         f"scipy {environment['scipy']}；Pillow {environment['pillow']}；"
         f"opencv-python {environment['opencv_python']}",
         f"- 工作区：{'有未提交改动' if dirty else '干净'}",
-        f"- 固定宽度：{WIDTH} 列；模式：plain、dither",
+        f"- 固定宽度：{WIDTH} 列；模式：{'、'.join(name for name, _ in MODES)}",
         f"- 样张：{'、'.join(path.name for path in SAMPLES)}",
         "",
         "## 结果",

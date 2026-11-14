@@ -523,7 +523,7 @@ fn bilinear(
     top * (1.0 - ty) + bottom * ty
 }
 
-fn color_luma(color: [u8; 3]) -> f32 {
+pub(crate) fn color_luma(color: [u8; 3]) -> f32 {
     (BT601_R * f32::from(color[0]) + BT601_G * f32::from(color[1]) + BT601_B * f32::from(color[2]))
         / 255.0
 }

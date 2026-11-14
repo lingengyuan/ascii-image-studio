@@ -5,7 +5,8 @@ use rayon::prelude::*;
 
 use crate::font_atlas::{BRAILLE_BAYER, BRAILLE_LAYOUT, CharGlyph, FontAtlas, braille_char};
 use crate::preprocess::{
-    CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, shape_density,
+    CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, color_luma,
+    shape_density,
 };
 
 const DIRECTION_PRIOR_WEIGHT: f32 = 0.04;
@@ -28,6 +29,20 @@ const FLOYD_STEINBERG_OFFSETS: [(f32, f32); 4] = [
     (CELL_WIDTH as f32, CELL_HEIGHT as f32),
 ];
 
+const REFINE_SWEEPS: usize = 3;
+const REFINE_CANDIDATE_COUNT: usize = 5;
+const REFINE_HVS_WEIGHT: f32 = 15.0;
+const REFINE_MEAN_WEIGHT: f32 = 3.0;
+const REFINE_EDGE_WEIGHT: f32 = 1.0;
+const HVS_KERNEL: [f32; 3] = [0.25, 0.5, 0.25];
+/// 与 `FLOYD_STEINBERG_OFFSETS` 同序：右、左下、下、右下。
+const REFINE_NEIGHBORS: [(isize, isize, f32, f32); 4] = [
+    (1, 0, CELL_WIDTH as f32, 0.0),
+    (-1, 1, -(CELL_WIDTH as f32), CELL_HEIGHT as f32),
+    (0, 1, 0.0, CELL_HEIGHT as f32),
+    (1, 1, CELL_WIDTH as f32, CELL_HEIGHT as f32),
+];
+
 const HORIZONTAL_CANDIDATES: &[char] = &['-', '_', '~'];
 const BACKSLASH_CANDIDATES: &[char] = &['\\', '\'', '`', ','];
 const VERTICAL_CANDIDATES: &[char] = &['|', '!', 'l', 'I', '(', ')'];
@@ -39,6 +54,7 @@ pub struct MatchConfig {
     pub dir_crunch: f32,
     pub edge_weight: f32,
     pub dither: bool,
+    pub refine: bool,
     pub color: bool,
     pub braille: bool,
 }
@@ -90,6 +106,8 @@ pub fn match_image(
         match_braille(image, atlas, config, &work, rows)
     } else if config.dither {
         match_ascii_serial(image, atlas, config, &work, rows, cell_count)
+    } else if config.refine {
+        match_ascii_refine(image, atlas, config, &work, rows, cell_count)
     } else {
         match_ascii_parallel(image, atlas, config, &work, rows)?
     };
@@ -179,6 +197,325 @@ fn match_ascii_serial(
         }
     }
     cells
+}
+
+/// 棋盘式候选重选只改字符选择：初始解仍是 6D 最近字，位图和前景色不动。
+fn match_ascii_refine(
+    image: &ProcessedImage,
+    atlas: &FontAtlas,
+    config: &MatchConfig,
+    work: &WorkImage,
+    rows: u32,
+    cell_count: usize,
+) -> Vec<AsciiCell> {
+    let glyphs = atlas.ascii();
+    let cols = config.cols as usize;
+    let row_count = rows as usize;
+    let mut cells = Vec::with_capacity(cell_count);
+
+    for row in 0..rows {
+        for col in 0..config.cols {
+            let direction = cell_direction(work, config, col, row);
+            let enhanced = enhanced_samples(work, col, row, config.dir_crunch);
+            let prior = direction_prior_from(direction.map(|direction| direction.edge));
+            let candidates = top_glyph_candidates(glyphs, enhanced, prior.as_ref());
+            let fg_color = foreground_color(image, config, CellPosition { col, row, rows });
+            let fg_luminance = color_luma(fg_color);
+            let target = mean_region(
+                work,
+                (
+                    col * CELL_WIDTH,
+                    row * CELL_HEIGHT,
+                    (col + 1) * CELL_WIDTH,
+                    (row + 1) * CELL_HEIGHT,
+                ),
+            );
+            let render = fg_luminance * glyphs[candidates[0].0].density;
+            cells.push(RefineCell {
+                candidates,
+                chosen: 0,
+                direction,
+                fg_color,
+                fg_luminance,
+                target,
+                render,
+            });
+        }
+    }
+
+    let target_means: Vec<f32> = cells.iter().map(|cell| cell.target).collect();
+    let render_means: Vec<f32> = cells.iter().map(|cell| cell.render).collect();
+    let blurred_target = blur_cell_grid(&target_means, cols, row_count);
+    let blurred_render = blur_cell_grid(&render_means, cols, row_count);
+    let hvs_error = blurred_target
+        .iter()
+        .zip(&target_means)
+        .zip(blurred_render.iter().zip(&render_means))
+        .map(|((target_blur, target), (render_blur, render))| {
+            (target_blur - target) - (render_blur - render)
+        })
+        .collect();
+    let initial_mean = render_means.iter().sum::<f32>() / cell_count as f32;
+    let global_sum = render_means.iter().sum();
+
+    let mut grid = RefineGrid {
+        glyphs,
+        cols,
+        rows: row_count,
+        cells,
+        blurred_target,
+        blurred_render,
+        hvs_error,
+        initial_mean,
+        global_sum,
+    };
+
+    for _ in 0..REFINE_SWEEPS {
+        for parity in 0..2_u32 {
+            for row in 0..rows {
+                for col in 0..config.cols {
+                    if (col + row) % 2 != parity {
+                        continue;
+                    }
+                    grid.refine_cell(row as usize * cols + col as usize);
+                }
+            }
+        }
+    }
+
+    grid.cells
+        .iter()
+        .map(|cell| {
+            let glyph = &grid.glyphs[cell.candidates[cell.chosen].0];
+            AsciiCell {
+                ch: glyph.ch,
+                fg_color: cell.fg_color,
+                density: shape_density(glyph.shape_vec),
+                bitmap: glyph.bitmap.clone(),
+            }
+        })
+        .collect()
+}
+
+/// 按基代价升序保留前 5 个候选；相同代价按字表顺序，保证与 `nearest_glyph` 的首选一致。
+fn top_glyph_candidates(
+    glyphs: &[CharGlyph],
+    target: [f32; 6],
+    prior: Option<&DirectionPrior>,
+) -> Vec<(usize, f32)> {
+    let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(REFINE_CANDIDATE_COUNT);
+    for (index, glyph) in glyphs.iter().enumerate() {
+        let cost = glyph_cost(glyph, target, prior);
+        let position = candidates
+            .iter()
+            .position(|(_, existing)| cost < *existing)
+            .unwrap_or(candidates.len());
+        if position < REFINE_CANDIDATE_COUNT {
+            candidates.insert(position, (index, cost));
+            if candidates.len() > REFINE_CANDIDATE_COUNT {
+                candidates.pop();
+            }
+        }
+    }
+    candidates
+}
+
+struct RefineCell {
+    candidates: Vec<(usize, f32)>,
+    /// `candidates` 的下标，不是字表下标。
+    chosen: usize,
+    direction: Option<CellDirection>,
+    fg_color: [u8; 3],
+    fg_luminance: f32,
+    target: f32,
+    render: f32,
+}
+
+struct RefineGrid<'a> {
+    glyphs: &'a [CharGlyph],
+    cols: usize,
+    rows: usize,
+    cells: Vec<RefineCell>,
+    blurred_target: Vec<f32>,
+    blurred_render: Vec<f32>,
+    /// 去均值后的 HVS 残差：目标局部起伏减渲染局部起伏。
+    hvs_error: Vec<f32>,
+    initial_mean: f32,
+    global_sum: f32,
+}
+
+impl RefineGrid<'_> {
+    fn refine_cell(&mut self, index: usize) {
+        let current_slot = self.cells[index].chosen;
+        let current_base = self.cells[index].candidates[current_slot].1;
+        let current_render = self.cells[index].render;
+        let mut best_slot = current_slot;
+        let mut best_score = current_base;
+
+        for slot in 0..self.cells[index].candidates.len() {
+            if slot == current_slot {
+                continue;
+            }
+            let (glyph_index, base_cost) = self.cells[index].candidates[slot];
+            let render = self.cells[index].fg_luminance * self.glyphs[glyph_index].density;
+            let delta_render = render - current_render;
+            let score = base_cost
+                + REFINE_HVS_WEIGHT * self.hvs_delta(index, delta_render)
+                + REFINE_MEAN_WEIGHT * self.mean_delta(delta_render)
+                + REFINE_EDGE_WEIGHT * self.edge_delta(index, current_render, render);
+            if score < best_score {
+                best_score = score;
+                best_slot = slot;
+            }
+        }
+
+        if best_slot != current_slot {
+            let glyph_index = self.cells[index].candidates[best_slot].0;
+            let render = self.cells[index].fg_luminance * self.glyphs[glyph_index].density;
+            self.accept(index, best_slot, render);
+        }
+    }
+
+    fn accept(&mut self, index: usize, slot: usize, render: f32) {
+        let delta_render = render - self.cells[index].render;
+        self.cells[index].chosen = slot;
+        self.cells[index].render = render;
+
+        let cols = self.cols;
+        let rows = self.rows;
+        let blurred_render = &mut self.blurred_render;
+        for_each_hvs_influence(index, cols, rows, |out, weight| {
+            blurred_render[out] += weight * delta_render;
+        });
+
+        let blurred_target = &self.blurred_target;
+        let blurred_render = &self.blurred_render;
+        let cells = &self.cells;
+        let hvs_error = &mut self.hvs_error;
+        for_each_hvs_influence(index, cols, rows, |out, _| {
+            hvs_error[out] = (blurred_target[out] - cells[out].target)
+                - (blurred_render[out] - cells[out].render);
+        });
+
+        self.global_sum += delta_render;
+    }
+
+    /// 单格渲染均值变化对 3x3 邻域 HVS 平方误差的增量。
+    fn hvs_delta(&self, index: usize, delta_render: f32) -> f32 {
+        let mut delta = 0.0;
+        for_each_hvs_influence(index, self.cols, self.rows, |out, weight| {
+            let de_meaned_delta = if out == index {
+                weight * delta_render - delta_render
+            } else {
+                weight * delta_render
+            };
+            let error = self.hvs_error[out];
+            delta += (error - de_meaned_delta).powi(2) - error.powi(2);
+        });
+        delta
+    }
+
+    fn mean_delta(&self, delta_render: f32) -> f32 {
+        let count = self.cells.len() as f32;
+        let current = self.global_sum / count - self.initial_mean;
+        let next = (self.global_sum + delta_render) / count - self.initial_mean;
+        next.powi(2) - current.powi(2)
+    }
+
+    fn edge_delta(&self, index: usize, current_render: f32, render: f32) -> f32 {
+        self.edge_energy(index, render) - self.edge_energy(index, current_render)
+    }
+
+    /// 只统计本格沿边的四项；相邻格的同一条边由相邻格自己的目标函数负责。
+    fn edge_energy(&self, index: usize, render: f32) -> f32 {
+        let cell = &self.cells[index];
+        let Some(direction) = cell.direction.filter(|direction| direction.diffuses) else {
+            return 0.0;
+        };
+        let col = index % self.cols;
+        let row = index / self.cols;
+        let mut energy = 0.0;
+        for (delta_col, delta_row, offset_x, offset_y) in REFINE_NEIGHBORS {
+            let neighbor_col = col as isize + delta_col;
+            let neighbor_row = row as isize + delta_row;
+            if !(0..self.cols as isize).contains(&neighbor_col)
+                || !(0..self.rows as isize).contains(&neighbor_row)
+            {
+                continue;
+            }
+            let neighbor = &self.cells[neighbor_row as usize * self.cols + neighbor_col as usize];
+            let Some(neighbor_direction) =
+                neighbor.direction.filter(|direction| direction.diffuses)
+            else {
+                continue;
+            };
+            let length = offset_x.hypot(offset_y);
+            let dot =
+                (offset_x * direction.edge.normal_x + offset_y * direction.edge.normal_y) / length;
+            let along = 1.0 - dot * dot;
+            energy += along
+                * direction.edge.strength
+                * neighbor_direction.edge.strength
+                * (render - neighbor.render).powi(2);
+        }
+        energy
+    }
+}
+
+/// 3x3 可分离 [1,2,1]/4 模糊，边界按复制处理。
+fn blur_cell_grid(values: &[f32], cols: usize, rows: usize) -> Vec<f32> {
+    let mut horizontal = vec![0.0; values.len()];
+    for row in 0..rows {
+        for col in 0..cols {
+            let left = values[row * cols + col.saturating_sub(1)];
+            let center = values[row * cols + col];
+            let right = values[row * cols + (col + 1).min(cols - 1)];
+            horizontal[row * cols + col] = (left + 2.0 * center + right) * 0.25;
+        }
+    }
+
+    let mut output = vec![0.0; values.len()];
+    for row in 0..rows {
+        for col in 0..cols {
+            let up = horizontal[row.saturating_sub(1) * cols + col];
+            let center = horizontal[row * cols + col];
+            let down = horizontal[(row + 1).min(rows - 1) * cols + col];
+            output[row * cols + col] = (up + 2.0 * center + down) * 0.25;
+        }
+    }
+    output
+}
+
+/// 单格变化只影响模糊核覆盖的输出格；夹取边界时一个输出格可能合并多个核偏移。
+fn for_each_hvs_influence(
+    index: usize,
+    cols: usize,
+    rows: usize,
+    mut visit: impl FnMut(usize, f32),
+) {
+    let row = index / cols;
+    let col = index % cols;
+    for output_row in row.saturating_sub(1)..=(row + 1).min(rows - 1) {
+        let row_weight = clamped_blur_weight(output_row, row, rows);
+        for output_col in col.saturating_sub(1)..=(col + 1).min(cols - 1) {
+            let weight = row_weight * clamped_blur_weight(output_col, col, cols);
+            if weight > 0.0 {
+                visit(output_row * cols + output_col, weight);
+            }
+        }
+    }
+}
+
+fn clamped_blur_weight(output: usize, source: usize, len: usize) -> f32 {
+    let mut weight = 0.0;
+    for (kernel_index, weight_component) in HVS_KERNEL.into_iter().enumerate() {
+        let offset = kernel_index as isize - 1;
+        let sampled = (output as isize + offset).clamp(0, len as isize - 1) as usize;
+        if sampled == source {
+            weight += weight_component;
+        }
+    }
+    weight
 }
 
 /// `enhanced` 已做过方向增强，这里不再 crunch，抖动路径才能与无抖动路径同形。
@@ -608,11 +945,12 @@ mod tests {
     use super::{
         BACKSLASH_CANDIDATES, CellDirection, CellPosition, DIFFUSION_RAMP_START,
         DIRECTION_PRIOR_WEIGHT, DirectionPrior, EdgeDirection, FLOYD_STEINBERG_WEIGHTS,
-        HORIZONTAL_CANDIDATES, MatchConfig, SLASH_CANDIDATES, VERTICAL_CANDIDATES,
-        build_ascii_cell, cell_direction, diffuse_scalar_error, diffusion_weights, dir_crunch,
-        direction_prior_from, directional_ascii, directional_candidates, distance_squared,
-        enhanced_samples, external_bounds, external_samples, internal_samples, match_image,
-        mean_region, nearest_glyph, output_rows, scale_to_density,
+        HORIZONTAL_CANDIDATES, MatchConfig, MatchedArt, REFINE_CANDIDATE_COUNT, SLASH_CANDIDATES,
+        VERTICAL_CANDIDATES, build_ascii_cell, cell_direction, diffuse_scalar_error,
+        diffusion_weights, dir_crunch, direction_prior_from, directional_ascii,
+        directional_candidates, distance_squared, enhanced_samples, external_bounds,
+        external_samples, internal_samples, match_image, mean_region, nearest_glyph, output_rows,
+        scale_to_density, top_glyph_candidates,
     };
     use crate::font_atlas::FontAtlas;
     use crate::preprocess::{
@@ -638,8 +976,16 @@ mod tests {
             dir_crunch: 2.5,
             edge_weight: 0.25,
             dither,
+            refine: false,
             color: false,
             braille: false,
+        }
+    }
+
+    fn refine_config() -> MatchConfig {
+        MatchConfig {
+            refine: true,
+            ..config(false)
         }
     }
 
@@ -671,6 +1017,22 @@ mod tests {
             }
         }
         DynamicImage::ImageRgb8(image)
+    }
+
+    /// 中心一条强竖边，两侧亮度差足够大，方向项和 HVS 项都有信号。
+    fn strong_edge_image(width: u32, height: u32) -> DynamicImage {
+        let mut image = RgbImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let value = if x < width / 2 { 230 } else { 20 };
+                image.put_pixel(x, y, Rgb([value, value, value]));
+            }
+        }
+        DynamicImage::ImageRgb8(image)
+    }
+
+    fn ascii_chars(art: &MatchedArt) -> Vec<char> {
+        art.cells.iter().map(|cell| cell.ch).collect()
     }
 
     /// 只按顺序拼装现有元件：先 crunch，再等比缩放模长，最后选字。
@@ -939,6 +1301,7 @@ mod tests {
             dir_crunch: 2.5,
             edge_weight: 0.25,
             dither: false,
+            refine: false,
             color: false,
             braille: false,
         };
@@ -1039,6 +1402,64 @@ mod tests {
                 .iter()
                 .zip(&repeated.cells)
                 .all(|(left, right)| left.ch == right.ch)
+        );
+    }
+
+    #[test]
+    fn top_glyph_candidates_start_with_the_best_and_keep_five() {
+        let atlas = FontAtlas::load().unwrap();
+        let target = [0.2, 0.8, 0.4, 0.1, 0.6, 0.3];
+        let candidates = top_glyph_candidates(atlas.ascii(), target, None);
+        assert_eq!(candidates.len(), REFINE_CANDIDATE_COUNT);
+        assert_eq!(
+            atlas.ascii()[candidates[0].0].ch,
+            nearest_glyph(atlas.ascii(), target, None).ch
+        );
+        assert!(
+            candidates
+                .windows(2)
+                .all(|window| window[0].1 <= window[1].1)
+        );
+    }
+
+    #[test]
+    fn refine_matching_is_deterministic() {
+        let image = strong_edge_image(80, 80);
+        let processed = preprocess(&image, 1.0, 0.25, ToneMap::Global).unwrap();
+        let atlas = FontAtlas::load().unwrap();
+        let first = match_image(&processed, &atlas, &refine_config()).unwrap();
+        let second = match_image(&processed, &atlas, &refine_config()).unwrap();
+        assert_eq!(ascii_chars(&first), ascii_chars(&second));
+    }
+
+    /// 强竖边给 HVS 邻域项足够信号；plain 路径必须完全不受 refine 影响。
+    #[test]
+    fn refine_can_change_a_glyph_without_affecting_plain() {
+        let image = strong_edge_image(80, 80);
+        let processed = preprocess(&image, 1.0, 0.25, ToneMap::Global).unwrap();
+        let atlas = FontAtlas::load().unwrap();
+        let plain_config = config(false);
+        let refined_config = MatchConfig {
+            refine: true,
+            ..plain_config.clone()
+        };
+
+        let plain = match_image(&processed, &atlas, &plain_config).unwrap();
+        let refined = match_image(&processed, &atlas, &refined_config).unwrap();
+        let plain_again = match_image(&processed, &atlas, &plain_config).unwrap();
+
+        assert_eq!(
+            ascii_chars(&plain),
+            ascii_chars(&plain_again),
+            "plain 输出不应受 refine 影响"
+        );
+        assert!(
+            plain
+                .cells
+                .iter()
+                .zip(&refined.cells)
+                .any(|(left, right)| left.ch != right.ch),
+            "强边图像上 refine 未改变任何字符"
         );
     }
 
@@ -1171,6 +1592,7 @@ mod tests {
             dir_crunch: 2.5,
             edge_weight: 0.25,
             dither: true,
+            refine: false,
             color: false,
             braille: false,
         };

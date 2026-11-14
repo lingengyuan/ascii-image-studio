@@ -43,6 +43,7 @@ fn run(cli: Cli) -> Result<()> {
         dir_crunch: cli.dir_crunch,
         edge_weight: cli.edge_weight,
         dither: cli.dither,
+        refine: cli.refine,
         color: cli.color,
         braille: cli.braille,
     };

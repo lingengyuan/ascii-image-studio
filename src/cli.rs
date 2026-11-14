@@ -45,6 +45,10 @@ pub struct Cli {
     #[arg(long)]
     pub dither: bool,
 
+    /// 网格级连续性细化：对 6D 匹配结果做 3 轮棋盘式候选重选，不使用抖动
+    #[arg(long, conflicts_with_all = ["dither", "braille"])]
+    pub refine: bool,
+
     /// 保留原图高亮像素颜色
     #[arg(long)]
     pub color: bool,
@@ -138,6 +142,15 @@ mod tests {
         assert_eq!(cli.tone_map, ToneMap::Clahe);
         assert_eq!(cli.dir_crunch, 2.5);
         assert_eq!(cli.edge_weight, 0.25);
+        assert!(!cli.refine);
+    }
+
+    #[test]
+    fn refine_is_opt_in_and_conflicts_with_other_ascii_paths() {
+        let cli = Cli::try_parse_from(["tool", "input.png", "--refine"]).unwrap();
+        assert!(cli.refine);
+        assert!(Cli::try_parse_from(["tool", "input.png", "--refine", "--dither"]).is_err());
+        assert!(Cli::try_parse_from(["tool", "input.png", "--refine", "--braille"]).is_err());
     }
 
     #[test]

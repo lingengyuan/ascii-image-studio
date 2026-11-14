@@ -28,6 +28,7 @@ cargo build --release
 | `-d, --dir-crunch` | `2.5` | 外部邻域方向锐化指数 |
 | `-e, --edge-weight` | `0.25` | 有符号 DoG 锐化权重；0 表示关闭 |
 | `--dither` | 关闭 | ASCII 用 Floyd–Steinberg；盲文用 2x4 Bayer 有序抖动 |
+| `--refine` | 关闭 | 网格级 top-5 局部搜索；与 `--dither`、`--braille` 互斥 |
 | `--color` | 关闭 | 保留原图高亮区域颜色 |
 | `--braille` | 关闭 | 使用 2x4 盲文点阵字符 |
 
@@ -37,6 +38,7 @@ cargo build --release
 - `--contrast` 在色调映射之后生效，两种模式语义相同。
 - 黑白输出的字符亮度按单元真实亮度调制为 `0.25 + 0.75 * Y_cell`，暗处字符不会保持纯白。`--color` 保留真实 RGB，不做这层调制。
 - `-e` 使用有符号 DoG 非锐化掩模，边缘亮侧更亮、暗侧更暗；Sobel 只提供方向和边缘强度。
+- `--refine` 以 6D 匹配为初值，用 3x3 单元 HVS、全局密度漂移和沿边密度平滑做 3 轮棋盘重选；不使用 Floyd–Steinberg。
 - 盲文没有字形方向选择，`--dir-crunch` 只影响 ASCII 字符匹配。
 - 透明像素先合成到黑底。
 
