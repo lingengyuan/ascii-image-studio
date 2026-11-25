@@ -160,6 +160,7 @@ const REFINE_SWEEPS: usize = 2;
 const REFINE_CANDIDATE_COUNT: usize = 16;
 const HVS_SIGMA_PIXELS: f32 = 3.5;
 const HVS_REACH: isize = 10;
+const HVS_DOWNSCALE: usize = 2;
 /// 像素 HVS 残差项权重。
 const REFINE_PIXEL_WEIGHT: f32 = 0.2;
 const REFINE_MEAN_WEIGHT: f32 = 3.0;
@@ -611,29 +612,42 @@ impl PixelHvs {
     fn new(work: &WorkImage, glyphs: &[CharGlyph], max_ink: f32) -> Self {
         let width = work.width as usize;
         let height = work.height as usize;
-        let kernel = gaussian_kernel(HVS_SIGMA_PIXELS);
-        let radius = HVS_REACH;
-        let footprint_width = CELL_WIDTH as usize + radius as usize * 2;
-        let footprint_height = CELL_HEIGHT as usize + radius as usize * 2;
-        let target = blur_values(&work.luma, width, height, &kernel, true);
-        let padded_width = width + radius as usize * 2;
-        let padded_height = height + radius as usize * 2;
+        let (values, grid_width, grid_height) = downsample2(&work.luma, width, height);
+        let radius = HVS_REACH / HVS_DOWNSCALE as isize;
+        let sigma = HVS_SIGMA_PIXELS / HVS_DOWNSCALE as f32;
+        let kernel = gaussian_kernel(sigma, radius);
+        let cell_width = CELL_WIDTH as usize / HVS_DOWNSCALE;
+        let cell_height = CELL_HEIGHT as usize / HVS_DOWNSCALE;
+        let footprint_width = cell_width + radius as usize * 2;
+        let footprint_height = cell_height + radius as usize * 2;
+        let target = blur_values(&values, grid_width, grid_height, &kernel, true);
+        let padded_width = grid_width + radius as usize * 2;
+        let padded_height = grid_height + radius as usize * 2;
         let mut residual = vec![0.0_f32; padded_width * padded_height];
-        for y in 0..height {
-            for x in 0..width {
+        for y in 0..grid_height {
+            for x in 0..grid_width {
                 residual[(y + radius as usize) * padded_width + x + radius as usize] =
-                    -target[y * width + x];
+                    -target[y * grid_width + x];
             }
         }
         let footprints: Vec<Vec<f32>> = glyphs
             .iter()
             .map(|glyph| {
                 let mut canvas = vec![0.0_f32; footprint_width * footprint_height];
-                for y in 0..CELL_HEIGHT as usize {
-                    for x in 0..CELL_WIDTH as usize {
-                        let value = f32::from(glyph.bitmap[y * CELL_WIDTH as usize + x]) / 255.0;
+                for y in 0..cell_height {
+                    for x in 0..cell_width {
+                        let mut sum = 0.0;
+                        for dy in 0..HVS_DOWNSCALE {
+                            for dx in 0..HVS_DOWNSCALE {
+                                let source_y = y * HVS_DOWNSCALE + dy;
+                                let source_x = x * HVS_DOWNSCALE + dx;
+                                sum += f32::from(
+                                    glyph.bitmap[source_y * CELL_WIDTH as usize + source_x],
+                                ) / 255.0;
+                            }
+                        }
                         canvas[(y + radius as usize) * footprint_width + x + radius as usize] =
-                            value / max_ink;
+                            sum / (HVS_DOWNSCALE * HVS_DOWNSCALE) as f32 / max_ink;
                     }
                 }
                 blur_values(&canvas, footprint_width, footprint_height, &kernel, false)
@@ -706,8 +720,8 @@ impl PixelHvs {
 
     fn origin(&self, col: u32, row: u32) -> (isize, isize) {
         (
-            col as isize * CELL_WIDTH as isize,
-            row as isize * CELL_HEIGHT as isize,
+            col as isize * (CELL_WIDTH / HVS_DOWNSCALE as u32) as isize,
+            row as isize * (CELL_HEIGHT / HVS_DOWNSCALE as u32) as isize,
         )
     }
 }
@@ -868,8 +882,35 @@ impl RefineGrid<'_> {
     }
 }
 
-fn gaussian_kernel(sigma: f32) -> Vec<f32> {
-    let radius = HVS_REACH;
+fn downsample2(values: &[f32], width: usize, height: usize) -> (Vec<f32>, usize, usize) {
+    let grid_width = width.div_ceil(HVS_DOWNSCALE);
+    let grid_height = height.div_ceil(HVS_DOWNSCALE);
+    let mut output = vec![0.0_f32; grid_width * grid_height];
+    for y in 0..grid_height {
+        for x in 0..grid_width {
+            let mut sum = 0.0;
+            let mut count = 0;
+            for dy in 0..HVS_DOWNSCALE {
+                let source_y = y * HVS_DOWNSCALE + dy;
+                if source_y >= height {
+                    continue;
+                }
+                for dx in 0..HVS_DOWNSCALE {
+                    let source_x = x * HVS_DOWNSCALE + dx;
+                    if source_x >= width {
+                        continue;
+                    }
+                    sum += values[source_y * width + source_x];
+                    count += 1;
+                }
+            }
+            output[y * grid_width + x] = sum / count.max(1) as f32;
+        }
+    }
+    (output, grid_width, grid_height)
+}
+
+fn gaussian_kernel(sigma: f32, radius: isize) -> Vec<f32> {
     let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
     let mut sum = 0.0;
     for offset in -radius..=radius {
