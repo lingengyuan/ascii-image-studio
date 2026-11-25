@@ -5,6 +5,7 @@ use crate::tone::{ToneMap, apply as apply_tone_map};
 
 pub const CELL_WIDTH: u32 = 10;
 pub const CELL_HEIGHT: u32 = 20;
+/// 6 个子块的实际面积权重；行带 5/4/5，左右各 5 列。
 pub const SHAPE_AREA_WEIGHTS: [f32; 6] = [0.15, 0.15, 0.175, 0.175, 0.175, 0.175];
 
 const BT601_R: f32 = 0.299;
@@ -45,11 +46,13 @@ pub struct WorkImage {
 
 pub fn cell_region_bounds(cell_col: u32, cell_row: u32, component: usize) -> (u32, u32, u32, u32) {
     let sub_col = (component % 2) as u32;
-    let sub_row = (component / 2) as u32;
+    let sub_row = component / 2;
+    const ROW_BANDS: [(u32, u32); 3] = [(0, 6), (6, 13), (13, 20)];
     let x0 = cell_col * CELL_WIDTH + sub_col * (CELL_WIDTH / 2);
     let x1 = x0 + CELL_WIDTH / 2;
-    let y0 = cell_row * CELL_HEIGHT + sub_row * CELL_HEIGHT / 3;
-    let y1 = cell_row * CELL_HEIGHT + (sub_row + 1) * CELL_HEIGHT / 3;
+    let (top, bottom) = ROW_BANDS[sub_row];
+    let y0 = cell_row * CELL_HEIGHT + top;
+    let y1 = cell_row * CELL_HEIGHT + bottom;
     (x0, y0, x1, y1)
 }
 

@@ -55,6 +55,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections import Counter
 from importlib import metadata
 from pathlib import Path
 
@@ -71,6 +72,8 @@ WIDTH = 120
 CELL_WIDTH = 10
 CELL_HEIGHT = 20
 HVS_SIGMA = 5.0
+# JetBrains Mono 10x20 单字最大覆墨率，取自 font_atlas 中 '@' 的 density。
+MAX_INK = 0.25735295
 
 SSIM_SIGMA = 1.5
 SSIM_WINDOW = 11
@@ -115,6 +118,13 @@ METRIC_KEYS = [
     "dog_corr",
     "density_diff",
     "density_mae",
+    "ssim_norm_hvs",
+    "fsim_norm_hvs",
+    "density_mae_norm",
+    "corr_hvs",
+    "unique_chars",
+    "vertical_stem_ratio",
+    "top1_char_ratio",
 ]
 
 _SSIM_AXIS = np.exp(
@@ -425,14 +435,41 @@ def density_metrics(reference: np.ndarray, compared: np.ndarray) -> tuple[float,
     return density_diff, density_mae
 
 
+def character_stats(path: Path) -> dict[str, float]:
+    text = path.read_text(encoding="utf-8")
+    chars = [char for char in text if char != "\n"]
+    total = len(chars)
+    if total == 0:
+        return {"unique_chars": 0.0, "vertical_stem_ratio": 0.0, "top1_char_ratio": 0.0}
+    counts = Counter(chars)
+    stems = sum(counts[char] for char in "!|i1:'")
+    return {
+        "unique_chars": len(counts) / 95.0,
+        "vertical_stem_ratio": stems / total,
+        "top1_char_ratio": max(counts.values()) / total,
+    }
+
+
+def density_mae_normalized(reference: np.ndarray, compared: np.ndarray) -> float:
+    """按单元平均覆墨率归一化；不能先逐像素除以 max_ink，否则亮字形会被裁顶。"""
+    rows = compared.shape[0] // CELL_HEIGHT
+    reference_cells = reference.reshape(rows, CELL_HEIGHT, WIDTH, CELL_WIDTH).mean(axis=(1, 3))
+    compared_cells = compared.reshape(rows, CELL_HEIGHT, WIDTH, CELL_WIDTH).mean(axis=(1, 3))
+    return float(
+        np.mean(np.abs(reference_cells / 255.0 - compared_cells / 255.0 / MAX_INK))
+    )
+
+
 def evaluate(binary: Path, sample: Path, mode_name: str, mode_flags: list[str]) -> dict:
     sample_name = sample.stem
     output_dir = EVAL_ROOT / sample_name / mode_name
     output_dir.mkdir(parents=True, exist_ok=True)
     render_path = output_dir / "render.png"
     processed_path = output_dir / "processed.png"
+    text_path = output_dir / "render.txt"
 
     render_once(binary, sample, mode_flags, render_path, processed_path)
+    render_once(binary, sample, mode_flags, text_path)
     hashes = [sha256(render_path)]
 
     runtimes: list[float] = []
@@ -460,6 +497,10 @@ def evaluate(binary: Path, sample: Path, mode_name: str, mode_flags: list[str]) 
     compared_unit = compared / 255.0
     density_diff, density_mae = density_metrics(reference_unit, compared_unit)
 
+    normalized = np.clip(compared / MAX_INK, 0.0, 255.0)
+    blurred_normalized = hvs_blur(normalized)
+    density_mae_norm = density_mae_normalized(reference, compared)
+
     metrics = {
         "ssim": ssim(reference_unit, compared_unit),
         "ssim_hvs": ssim(blurred_reference / 255.0, blurred_compared / 255.0),
@@ -471,6 +512,11 @@ def evaluate(binary: Path, sample: Path, mode_name: str, mode_flags: list[str]) 
         ),
         "density_diff": density_diff,
         "density_mae": density_mae,
+        "ssim_norm_hvs": ssim(blurred_reference / 255.0, blurred_normalized / 255.0),
+        "fsim_norm_hvs": fsim(blurred_reference, blurred_normalized),
+        "density_mae_norm": density_mae_norm,
+        "corr_hvs": pearson(blurred_reference, blurred_compared),
+        **character_stats(text_path),
     }
 
     return {
@@ -576,14 +622,16 @@ def write_baseline_doc(
         "",
         "## 结果",
         "",
-        "| sample | mode | SSIM | SSIM@σ5 | FSIM | FSIM@σ5 | Sobel corr | DoG corr | density diff | density MAE | runtime s | deterministic |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| sample | mode | SSIM | SSIM@σ5 | FSIM | FSIM@σ5 | Sobel corr | DoG corr | density diff | density MAE | SSIM_norm@σ5 | FSIM_norm@σ5 | density MAE norm | corr@σ5 | unique chars | vertical stem | top1 char | runtime s | deterministic |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in rows:
         metrics = row["metrics"]
         lines.append(
             "| {sample} | {mode} | {ssim} | {ssim_hvs} | {fsim} | {fsim_hvs} | "
-            "{sobel_corr} | {dog_corr} | {density_diff} | {density_mae} | {runtime:.3f} | {deterministic} |".format(
+            "{sobel_corr} | {dog_corr} | {density_diff} | {density_mae} | "
+            "{ssim_norm_hvs} | {fsim_norm_hvs} | {density_mae_norm} | {corr_hvs} | "
+            "{unique_chars} | {vertical_stem_ratio} | {top1_char_ratio} | {runtime:.3f} | {deterministic} |".format(
                 sample=row["sample"],
                 mode=row["mode"],
                 ssim=format_value(metrics["ssim"]),
@@ -594,6 +642,13 @@ def write_baseline_doc(
                 dog_corr=format_value(metrics["dog_corr"]),
                 density_diff=format_value(metrics["density_diff"]),
                 density_mae=format_value(metrics["density_mae"]),
+                ssim_norm_hvs=format_value(metrics["ssim_norm_hvs"]),
+                fsim_norm_hvs=format_value(metrics["fsim_norm_hvs"]),
+                density_mae_norm=format_value(metrics["density_mae_norm"]),
+                corr_hvs=format_value(metrics["corr_hvs"]),
+                unique_chars=format_value(metrics["unique_chars"]),
+                vertical_stem_ratio=format_value(metrics["vertical_stem_ratio"]),
+                top1_char_ratio=format_value(metrics["top1_char_ratio"]),
                 runtime=row["runtime_s"],
                 deterministic="yes" if row["deterministic"] else "no",
             )
@@ -619,6 +674,11 @@ def write_baseline_doc(
         "- DoG corr：目标图与渲染图 DoG 图（Gaussian σ=1.0 减 σ=2.0）的 Pearson 相关系数。",
         "- density diff：两图全局均值之差的绝对值。",
         "- density MAE：按 10x20 像素块取均值后，120 x rows 单元网格的平均绝对误差。",
+        f"- SSIM_norm@σ5、FSIM_norm@σ5、density MAE norm：渲染图先按字体最大覆墨率 `MAX_INK={MAX_INK}` 线性缩放并裁到 0..255，再计算同名模糊指标，消除 4 倍物理覆墨上限造成的尺度偏差。",
+        "- corr@σ5：目标图与渲染图 HVS 模糊后的 Pearson 相关系数，不受线性明度缩放影响。",
+        "- unique chars：实际使用的不同字符数 / 95。",
+        "- vertical stem：`! | i 1 : '` 六类竖线字符的占比，用于监控竖条纹塌缩。",
+        "- top1 char：最高频单字符占比，用于监控单一字符刷屏。",
         "- runtime s：3 次渲染耗时的中位数；计时不含 `--dump-processed`。",
         "- deterministic：导出运行加 3 次计时运行，4 份渲染 PNG 的 SHA-256 完全一致。",
         "",
@@ -667,8 +727,9 @@ def main() -> int:
             metrics = row["metrics"]
             print(
                 f"[{len(rows):>2}/{total}] {row['sample']:<18} {row['mode']:<6} "
-                f"SSIM={metrics['ssim']:.4f} FSIM={metrics['fsim']:.4f} "
-                f"density_mae={metrics['density_mae']:.4f} "
+                f"SSIM={metrics['ssim']:.4f} SSIM_norm@σ5={metrics['ssim_norm_hvs']:.4f} "
+                f"FSIM={metrics['fsim']:.4f} density_mae={metrics['density_mae']:.4f} "
+                f"stem={metrics['vertical_stem_ratio']:.3f} "
                 f"runtime={row['runtime_s']:.3f}s det={'yes' if row['deterministic'] else 'no'}"
             )
             for key, value in metrics.items():

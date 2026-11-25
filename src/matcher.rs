@@ -4,10 +4,9 @@ use anyhow::{Result, ensure};
 use rayon::prelude::*;
 
 use crate::aiss;
-use crate::font_atlas::{BRAILLE_BAYER, BRAILLE_LAYOUT, CharGlyph, FontAtlas, braille_char};
+use crate::font_atlas::{BRAILLE_BLUE_NOISE, BRAILLE_LAYOUT, CharGlyph, FontAtlas, braille_char};
 use crate::preprocess::{
     CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, color_luma,
-    shape_density,
 };
 
 const CELL_PIXELS: usize = (CELL_WIDTH * CELL_HEIGHT) as usize;
@@ -24,12 +23,137 @@ const DIRECTION_MIN_ABSOLUTE_EDGE: f32 = 0.57;
 // 扩散斜坡起点低于选字先验，让中等强度边缘也参与；上端沿用先验。
 const DIFFUSION_RAMP_START: f32 = 0.29;
 const DIFFUSION_RAMP_END: f32 = DIRECTION_PRIOR_RAMP_END;
-const FLOYD_STEINBERG_WEIGHTS: [f32; 4] = [7.0 / 16.0, 3.0 / 16.0, 5.0 / 16.0, 1.0 / 16.0];
-const FLOYD_STEINBERG_OFFSETS: [(f32, f32); 4] = [
-    (CELL_WIDTH as f32, 0.0),
-    (-(CELL_WIDTH as f32), CELL_HEIGHT as f32),
-    (0.0, CELL_HEIGHT as f32),
-    (CELL_WIDTH as f32, CELL_HEIGHT as f32),
+/// Ostromoukhov (2001) 变量系数表：i=0..127，D(i)=D(255-i)。
+/// 每项是三个未归一化的分布系数，对应扫描方向的前方、左下、正下。
+const OSTROMOUKHOV_WEIGHTS: [[u16; 3]; 128] = [
+    [13, 0, 5],
+    [13, 0, 5],
+    [21, 0, 10],
+    [7, 0, 4],
+    [8, 0, 5],
+    [47, 3, 28],
+    [23, 3, 13],
+    [15, 3, 8],
+    [22, 6, 11],
+    [43, 15, 20],
+    [7, 3, 3],
+    [501, 224, 211],
+    [249, 116, 103],
+    [165, 80, 67],
+    [123, 62, 49],
+    [489, 256, 191],
+    [81, 44, 31],
+    [483, 272, 181],
+    [60, 35, 22],
+    [53, 32, 19],
+    [237, 148, 83],
+    [471, 304, 161],
+    [3, 2, 1],
+    [481, 314, 185],
+    [354, 226, 155],
+    [1389, 866, 685],
+    [227, 138, 125],
+    [267, 158, 163],
+    [327, 188, 220],
+    [61, 34, 45],
+    [627, 338, 505],
+    [1227, 638, 1075],
+    [20, 10, 19],
+    [1937, 1000, 1767],
+    [977, 520, 855],
+    [657, 360, 551],
+    [71, 40, 57],
+    [2005, 1160, 1539],
+    [337, 200, 247],
+    [2039, 1240, 1425],
+    [257, 160, 171],
+    [691, 440, 437],
+    [1045, 680, 627],
+    [301, 200, 171],
+    [177, 120, 95],
+    [2141, 1480, 1083],
+    [1079, 760, 513],
+    [725, 520, 323],
+    [137, 100, 57],
+    [2209, 1640, 855],
+    [53, 40, 19],
+    [2243, 1720, 741],
+    [565, 440, 171],
+    [759, 600, 209],
+    [1147, 920, 285],
+    [2311, 1880, 513],
+    [97, 80, 19],
+    [335, 280, 57],
+    [1181, 1000, 171],
+    [793, 680, 95],
+    [599, 520, 57],
+    [2413, 2120, 171],
+    [405, 360, 19],
+    [2447, 2200, 57],
+    [11, 10, 0],
+    [158, 151, 3],
+    [178, 179, 7],
+    [1030, 1091, 63],
+    [248, 277, 21],
+    [318, 375, 35],
+    [458, 571, 63],
+    [878, 1159, 147],
+    [5, 7, 1],
+    [172, 181, 37],
+    [97, 76, 22],
+    [72, 41, 17],
+    [119, 47, 29],
+    [4, 1, 1],
+    [4, 1, 1],
+    [4, 1, 1],
+    [4, 1, 1],
+    [4, 1, 1],
+    [4, 1, 1],
+    [4, 1, 1],
+    [4, 1, 1],
+    [4, 1, 1],
+    [65, 18, 17],
+    [95, 29, 26],
+    [185, 62, 53],
+    [30, 11, 9],
+    [35, 14, 11],
+    [85, 37, 28],
+    [55, 26, 19],
+    [80, 41, 29],
+    [155, 86, 59],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [5, 3, 2],
+    [305, 176, 119],
+    [155, 86, 59],
+    [105, 56, 39],
+    [80, 41, 29],
+    [65, 32, 23],
+    [55, 26, 19],
+    [335, 152, 113],
+    [85, 37, 28],
+    [115, 48, 37],
+    [35, 14, 11],
+    [355, 136, 109],
+    [30, 11, 9],
+    [365, 128, 107],
+    [185, 62, 53],
+    [25, 8, 7],
+    [95, 29, 26],
+    [385, 112, 103],
+    [65, 18, 17],
+    [395, 104, 101],
+    [4, 1, 1],
 ];
 
 const REFINE_SWEEPS: usize = 3;
@@ -43,16 +167,18 @@ const AISS_CANDIDATE_COUNT: usize = 10;
 /// 0.1 到 0.4 的重排会压低固定样张的 FSIM@σ5。0.01 让 FSIM@σ5 近似持平
 /// （平均 -0.004%），模糊 SSIM 和 density MAE 5/5 改善。未参与调参的
 /// Hay Wain 样张上模糊 SSIM、density MAE 4/4 改善，FSIM@σ5 波动在 ±0.03% 内。
-const AISS_WEIGHT: f32 = 0.01;
+const AISS_WEIGHT: f32 = 0.1;
 /// 门限用归一化前的平均 Sobel 幅值，低对比单元不会因为归一化而被放大。
 /// 满幅台阶（0→1）为 0.510，1/255 台阶为 0.002，2/255 为 0.004，取 0.005 都挡下。
 /// 固定样张的回退占比：portrait 0.7%、high-texture 2.6%、landscape 2.9%、
 /// low-contrast 6.0%、lineart 7.0%（其中大部分是空白边）。
 const AISS_MIN_CELL_EDGE: f32 = 0.005;
+/// 匹配代价的两项权重：去均值形状距离与归一化密度误差。
+const SHAPE_WEIGHT: f32 = 1.0;
+const DENSITY_WEIGHT: f32 = 15.0;
 /// 小权重把候选拉回本格目标均值；全局均值项仍防止整图漂移。
 const REFINE_DENSITY_WEIGHT: f32 = 0.20;
 const HVS_KERNEL: [f32; 3] = [0.25, 0.5, 0.25];
-/// 与 `FLOYD_STEINBERG_OFFSETS` 同序：右、左下、下、右下。
 const REFINE_NEIGHBORS: [(isize, isize, f32, f32); 4] = [
     (1, 0, CELL_WIDTH as f32, 0.0),
     (-1, 1, -(CELL_WIDTH as f32), CELL_HEIGHT as f32),
@@ -174,7 +300,7 @@ fn match_ascii_parallel(
                         atlas,
                         config,
                         CellPosition { col, row, rows },
-                        enhanced_samples(work, col, row, config.dir_crunch),
+                        cell_target(work, col, row, config.dir_crunch, atlas.shape_scale()),
                         direction,
                     )
                 })
@@ -200,14 +326,11 @@ fn match_ascii_aiss(
             (0..config.cols)
                 .map(|col| {
                     let direction = cell_direction(work, config, col, row);
-                    let enhanced = enhanced_samples(work, col, row, config.dir_crunch);
+                    let target =
+                        cell_target(work, col, row, config.dir_crunch, atlas.shape_scale());
                     let prior = direction_prior_from(direction.map(|direction| direction.edge));
-                    let candidates = top_glyph_candidates(
-                        glyphs,
-                        enhanced,
-                        prior.as_ref(),
-                        AISS_CANDIDATE_COUNT,
-                    );
+                    let candidates =
+                        top_glyph_candidates(glyphs, target, prior.as_ref(), AISS_CANDIDATE_COUNT);
                     let glyph_index = match aiss_cell_descriptor(work, col, row) {
                         Some(descriptor) => candidates
                             .iter()
@@ -230,8 +353,13 @@ fn match_ascii_aiss(
                     let glyph = &glyphs[glyph_index];
                     AsciiCell {
                         ch: glyph.ch,
-                        fg_color: foreground_color(image, config, CellPosition { col, row, rows }),
-                        density: shape_density(glyph.shape_vec),
+                        fg_color: foreground_color(
+                            image,
+                            config,
+                            CellPosition { col, row, rows },
+                            glyph.density_norm,
+                        ),
+                        density: glyph.density_norm,
                         bitmap: glyph.bitmap.clone(),
                     }
                 })
@@ -276,28 +404,34 @@ fn match_ascii_serial(
     let mut errors = vec![0.0_f32; cell_count];
 
     for row in 0..rows {
-        for col in 0..config.cols {
+        // 单元级测试：蛇形换向会让三邻域系数失配，SSIM_norm 下降约 0.1，暂保留栅格扫描。
+        let forward = true;
+        for step in 0..config.cols {
+            let col = if forward {
+                step
+            } else {
+                config.cols - 1 - step
+            };
             let index = cell_index(config.cols, col, row);
             // 与无抖动路径同一份方向增强结果；抖动只改密度，不改方向。
             let direction = cell_direction(work, config, col, row);
-            let enhanced = enhanced_samples(work, col, row, config.dir_crunch);
-            let target_density = (shape_density(enhanced) + errors[index]).clamp(0.0, 1.0);
-            let adjusted = scale_to_density(enhanced, target_density);
+            let mut target = cell_target(work, col, row, config.dir_crunch, atlas.shape_scale());
+            target.density = (target.density + errors[index]).clamp(0.0, 1.0);
+            let (weights, offsets) = dither_weights(direction, forward, target.density);
             let cell = build_ascii_cell(
                 image,
                 atlas,
                 config,
                 CellPosition { col, row, rows },
-                adjusted,
+                target,
                 direction,
             );
-            diffuse_scalar_error(
-                config.cols,
-                rows,
-                col,
-                row,
-                target_density - cell.density,
-                diffusion_weights(direction),
+            diffuse_three_errors(
+                (config.cols, rows),
+                (col, row),
+                target.density - cell.density,
+                weights,
+                offsets,
                 &mut errors,
             );
             cells.push(cell);
@@ -323,22 +457,19 @@ fn match_ascii_refine(
     for row in 0..rows {
         for col in 0..config.cols {
             let direction = cell_direction(work, config, col, row);
-            let enhanced = enhanced_samples(work, col, row, config.dir_crunch);
+            let match_target = cell_target(work, col, row, config.dir_crunch, atlas.shape_scale());
             let prior = direction_prior_from(direction.map(|direction| direction.edge));
             let candidates =
-                top_glyph_candidates(glyphs, enhanced, prior.as_ref(), REFINE_CANDIDATE_COUNT);
-            let fg_color = foreground_color(image, config, CellPosition { col, row, rows });
-            let fg_luminance = color_luma(fg_color);
-            let target = mean_region(
-                work,
-                (
-                    col * CELL_WIDTH,
-                    row * CELL_HEIGHT,
-                    (col + 1) * CELL_WIDTH,
-                    (row + 1) * CELL_HEIGHT,
-                ),
+                top_glyph_candidates(glyphs, match_target, prior.as_ref(), REFINE_CANDIDATE_COUNT);
+            let fg_color = foreground_color(
+                image,
+                config,
+                CellPosition { col, row, rows },
+                glyphs[candidates[0].0].density_norm,
             );
-            let render = fg_luminance * glyphs[candidates[0].0].density;
+            let fg_luminance = color_luma(fg_color);
+            let target = match_target.density;
+            let render = fg_luminance * glyphs[candidates[0].0].density_norm;
             cells.push(RefineCell {
                 candidates,
                 chosen: 0,
@@ -398,7 +529,7 @@ fn match_ascii_refine(
             AsciiCell {
                 ch: glyph.ch,
                 fg_color: cell.fg_color,
-                density: shape_density(glyph.shape_vec),
+                density: glyph.density_norm,
                 bitmap: glyph.bitmap.clone(),
             }
         })
@@ -408,7 +539,7 @@ fn match_ascii_refine(
 /// 按基代价升序保留前 `count` 个候选；相同代价按字表顺序，保证与 `nearest_glyph` 的首选一致。
 fn top_glyph_candidates(
     glyphs: &[CharGlyph],
-    target: [f32; 6],
+    target: MatchTarget,
     prior: Option<&DirectionPrior>,
     count: usize,
 ) -> Vec<(usize, f32)> {
@@ -466,7 +597,7 @@ impl RefineGrid<'_> {
                 continue;
             }
             let (glyph_index, base_cost) = self.cells[index].candidates[slot];
-            let render = self.cells[index].fg_luminance * self.glyphs[glyph_index].density;
+            let render = self.cells[index].fg_luminance * self.glyphs[glyph_index].density_norm;
             let delta_render = render - current_render;
             let score = base_cost
                 + REFINE_HVS_WEIGHT * self.hvs_delta(index, delta_render)
@@ -481,7 +612,7 @@ impl RefineGrid<'_> {
 
         if best_slot != current_slot {
             let glyph_index = self.cells[index].candidates[best_slot].0;
-            let render = self.cells[index].fg_luminance * self.glyphs[glyph_index].density;
+            let render = self.cells[index].fg_luminance * self.glyphs[glyph_index].density_norm;
             self.accept(index, best_slot, render);
         }
     }
@@ -664,19 +795,19 @@ fn build_ascii_cell(
     atlas: &FontAtlas,
     config: &MatchConfig,
     position: CellPosition,
-    enhanced: [f32; 6],
+    target: MatchTarget,
     direction: Option<CellDirection>,
 ) -> AsciiCell {
     let glyph = nearest_glyph(
         atlas.ascii(),
-        enhanced,
+        target,
         direction_prior_from(direction.map(|direction| direction.edge)).as_ref(),
     );
 
     AsciiCell {
         ch: glyph.ch,
-        fg_color: foreground_color(image, config, position),
-        density: shape_density(glyph.shape_vec),
+        fg_color: foreground_color(image, config, position, glyph.density_norm),
+        density: glyph.density_norm,
         bitmap: glyph.bitmap.clone(),
     }
 }
@@ -720,7 +851,10 @@ fn build_braille_cell(
     for (bit, sample) in samples.into_iter().enumerate() {
         let threshold = if ordered_dither {
             let (dot_row, dot_col) = BRAILLE_LAYOUT[bit];
-            (f32::from(BRAILLE_BAYER[dot_row][dot_col]) + 0.5) / 8.0
+            let x = position.col * CELL_WIDTH + dot_col as u32 * 5;
+            let y = position.row * CELL_HEIGHT + dot_row as u32 * 5;
+            let value = BRAILLE_BLUE_NOISE[y as usize % 16][x as usize % 16];
+            (f32::from(value) + 0.5) / 256.0
         } else {
             0.5
         };
@@ -728,17 +862,46 @@ fn build_braille_cell(
             bits |= 1 << bit;
         }
     }
+    let density = bits.count_ones() as f32 / 8.0;
     AsciiCell {
         ch: braille_char(bits),
-        fg_color: foreground_color(image, config, position),
-        density: bits.count_ones() as f32 / 8.0,
+        fg_color: foreground_color(image, config, position, density),
+        density,
         bitmap: atlas.braille_bitmap(bits),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MatchTarget {
+    /// 去均值后的 6D 形状，与整体密度解耦。
+    shape: [f32; 6],
+    /// 单元平均亮度，0..1。
+    density: f32,
+}
+
+fn cell_target(
+    work: &WorkImage,
+    col: u32,
+    row: u32,
+    exponent: f32,
+    shape_scale: f32,
+) -> MatchTarget {
+    let shape = enhanced_samples(work, col, row, exponent, shape_scale);
+    let bounds = (
+        col * CELL_WIDTH,
+        row * CELL_HEIGHT,
+        col * CELL_WIDTH + CELL_WIDTH,
+        row * CELL_HEIGHT + CELL_HEIGHT,
+    );
+    MatchTarget {
+        shape,
+        density: mean_region(work, bounds),
     }
 }
 
 fn nearest_glyph<'a>(
     glyphs: &'a [CharGlyph],
-    target: [f32; 6],
+    target: MatchTarget,
     prior: Option<&DirectionPrior>,
 ) -> &'a CharGlyph {
     glyphs
@@ -749,8 +912,10 @@ fn nearest_glyph<'a>(
         .expect("ASCII atlas is not empty")
 }
 
-fn glyph_cost(glyph: &CharGlyph, target: [f32; 6], prior: Option<&DirectionPrior>) -> f32 {
-    let mut cost = distance_squared(glyph.shape_vec, target);
+fn glyph_cost(glyph: &CharGlyph, target: MatchTarget, prior: Option<&DirectionPrior>) -> f32 {
+    let shape_cost = distance_squared(glyph.shape_vec, target.shape);
+    let density_cost = (glyph.density_norm - target.density).powi(2);
+    let mut cost = SHAPE_WEIGHT * shape_cost + DENSITY_WEIGHT * density_cost;
     if let Some(prior) = prior
         && !prior.candidates.contains(&glyph.ch)
     {
@@ -779,12 +944,20 @@ fn dir_crunch(raw: [f32; 6], external: [f32; 6], exponent: f32) -> [f32; 6] {
 }
 
 /// 方向增强只做一次：无抖动与抖动两条路径都用这个结果选字。
-fn enhanced_samples(work: &WorkImage, col: u32, row: u32, exponent: f32) -> [f32; 6] {
+fn enhanced_samples(
+    work: &WorkImage,
+    col: u32,
+    row: u32,
+    exponent: f32,
+    shape_scale: f32,
+) -> [f32; 6] {
+    let scale = shape_scale.max(1.0e-6);
     dir_crunch(
         internal_samples(work, col, row),
         external_samples(work, col, row),
         exponent,
     )
+    .map(|value| value / scale)
 }
 
 fn internal_samples(work: &WorkImage, col: u32, row: u32) -> [f32; 6] {
@@ -992,31 +1165,22 @@ fn foreground_color(
     image: &ProcessedImage,
     config: &MatchConfig,
     position: CellPosition,
+    glyph_density: f32,
 ) -> [u8; 3] {
     if config.color {
         return image.cell_highlight_color(config.cols, position.rows, position.col, position.row);
     }
-    let luminance = image.cell_luminance(config.cols, position.rows, position.col, position.row);
-    let level = (0.25 + 0.75 * luminance.clamp(0.0, 1.0)) * 255.0;
-    [level.round().clamp(0.0, 255.0) as u8; 3]
-}
-
-/// 把 6D 形状缩放到目标密度并保持方向。零向量没有方向，按面积权重均分。
-///
-/// 缩放只有一个比例，所以分量之间的比值不变。有分量碰到 1.0 时整体停止放大，
-/// 达不到的密度留给调用方当标量残差扩散；逐分量截断会改变方向，不能这么做。
-fn scale_to_density(shape: [f32; 6], target_density: f32) -> [f32; 6] {
-    let target = target_density.clamp(0.0, 1.0);
-    let current = shape_density(shape);
-    if current <= 1.0e-6 {
-        return [target; 6];
+    // 抖动需要固定前景，误差扩散才能改变最终亮度；1B 补偿会把误差抵消。
+    if config.dither {
+        return [255; 3];
     }
-    let peak = shape.into_iter().fold(0.0_f32, f32::max);
-    let mut scale = target / current;
-    if peak > 1.0e-6 {
-        scale = scale.min(1.0 / peak);
-    }
-    shape.map(|value| value * scale)
+    let target = image.cell_luminance(config.cols, position.rows, position.col, position.row);
+    let level = if glyph_density > 1.0e-6 {
+        (target / glyph_density).clamp(0.25, 1.0)
+    } else {
+        1.0
+    };
+    [(level * 255.0).round().clamp(0.0, 255.0) as u8; 3]
 }
 
 #[derive(Clone, Copy)]
@@ -1030,50 +1194,66 @@ fn cell_index(cols: u32, col: u32, row: u32) -> usize {
     row as usize * cols as usize + col as usize
 }
 
-/// 强边缘上把 FS 误差沿边缘扩散：垂直边缘的右邻权重趋近 0，水平边缘的下邻权重趋近 0。
-fn diffusion_weights(direction: Option<CellDirection>) -> [f32; 4] {
+fn ostromoukhov_coefficients(level: f32) -> [f32; 3] {
+    let index = (level.clamp(0.0, 1.0) * 255.0).round() as usize;
+    let table_index = if index <= 127 { index } else { 255 - index };
+    let [a, b, c] = OSTROMOUKHOV_WEIGHTS[table_index];
+    let sum = f32::from(a + b + c).max(1.0);
+    [f32::from(a) / sum, f32::from(b) / sum, f32::from(c) / sum]
+}
+
+/// 蛇形扫描的三邻域权重：前向、左下/右下、正下；强边时沿边权重增大。
+fn dither_weights(
+    direction: Option<CellDirection>,
+    forward: bool,
+    level: f32,
+) -> ([f32; 3], [(isize, isize); 3]) {
+    let base = ostromoukhov_coefficients(level);
+    let offsets = if forward {
+        [(1, 0), (-1, 1), (0, 1)]
+    } else {
+        [(-1, 0), (1, 1), (0, 1)]
+    };
     let Some(direction) = direction.filter(|direction| direction.diffuses) else {
-        return FLOYD_STEINBERG_WEIGHTS;
+        return (base, offsets);
     };
     let edge = direction.edge;
     let ramp = ((edge.strength - DIFFUSION_RAMP_START)
         / (DIFFUSION_RAMP_END - DIFFUSION_RAMP_START))
         .clamp(0.0, 1.0);
     if ramp <= 0.0 {
-        return FLOYD_STEINBERG_WEIGHTS;
+        return (base, offsets);
     }
-    let mut weights = FLOYD_STEINBERG_WEIGHTS;
-    for (weight, (dx, dy)) in weights.iter_mut().zip(FLOYD_STEINBERG_OFFSETS) {
-        let length = dx.hypot(dy);
-        let along = 1.0 - ((dx * edge.normal_x + dy * edge.normal_y) / length).powi(2);
+    let mut weights = base;
+    for (weight, (dx, dy)) in weights.iter_mut().zip(offsets) {
+        let px = dx as f32 * CELL_WIDTH as f32;
+        let py = dy as f32 * CELL_HEIGHT as f32;
+        let length = px.hypot(py);
+        let along = 1.0 - ((px * edge.normal_x + py * edge.normal_y) / length).powi(2);
         *weight *= (1.0 - ramp) + ramp * along;
     }
     let sum: f32 = weights.iter().sum();
     if sum <= 1.0e-6 {
-        return FLOYD_STEINBERG_WEIGHTS;
+        return (base, offsets);
     }
-    weights.map(|weight| weight / sum)
+    (weights.map(|weight| weight / sum), offsets)
 }
 
-fn diffuse_scalar_error(
-    cols: u32,
-    rows: u32,
-    col: u32,
-    row: u32,
+fn diffuse_three_errors(
+    dims: (u32, u32),
+    position: (u32, u32),
     error: f32,
-    weights: [f32; 4],
+    weights: [f32; 3],
+    offsets: [(isize, isize); 3],
     errors: &mut [f32],
 ) {
-    if col + 1 < cols {
-        errors[cell_index(cols, col + 1, row)] += error * weights[0];
-    }
-    if row + 1 < rows {
-        if col > 0 {
-            errors[cell_index(cols, col - 1, row + 1)] += error * weights[1];
-        }
-        errors[cell_index(cols, col, row + 1)] += error * weights[2];
-        if col + 1 < cols {
-            errors[cell_index(cols, col + 1, row + 1)] += error * weights[3];
+    let (cols, rows) = dims;
+    let (col, row) = position;
+    for (weight, (dx, dy)) in weights.into_iter().zip(offsets) {
+        let target_col = col as isize + dx;
+        let target_row = row as isize + dy;
+        if (0..cols as isize).contains(&target_col) && (0..rows as isize).contains(&target_row) {
+            errors[cell_index(cols, target_col as u32, target_row as u32)] += error * weight;
         }
     }
 }
@@ -1083,22 +1263,17 @@ mod tests {
     use image::{DynamicImage, Rgb, RgbImage};
 
     use super::{
-        BACKSLASH_CANDIDATES, CellDirection, CellPosition, CharGlyph, DIFFUSION_RAMP_START,
-        DIRECTION_PRIOR_WEIGHT, DirectionPrior, EdgeDirection, FLOYD_STEINBERG_WEIGHTS,
-        HORIZONTAL_CANDIDATES, MatchConfig, MatchedArt, REFINE_CANDIDATE_COUNT,
-        REFINE_DENSITY_WEIGHT, REFINE_EDGE_WEIGHT, REFINE_HVS_WEIGHT, REFINE_MEAN_WEIGHT,
-        REFINE_NEIGHBORS, RefineCell, RefineGrid, SLASH_CANDIDATES, VERTICAL_CANDIDATES,
-        aiss_cell_descriptor, blur_cell_grid, build_ascii_cell, cell_direction,
-        diffuse_scalar_error, diffusion_weights, dir_crunch, direction_prior_from,
-        directional_ascii, directional_candidates, distance_squared, enhanced_samples,
-        external_bounds, external_samples, internal_samples, match_image, mean_region,
-        nearest_glyph, output_rows, scale_to_density, top_glyph_candidates,
+        BACKSLASH_CANDIDATES, CellDirection, CharGlyph, DIFFUSION_RAMP_START,
+        DIRECTION_PRIOR_WEIGHT, DirectionPrior, EdgeDirection, HORIZONTAL_CANDIDATES, MatchConfig,
+        MatchTarget, MatchedArt, REFINE_CANDIDATE_COUNT, REFINE_DENSITY_WEIGHT, REFINE_EDGE_WEIGHT,
+        REFINE_HVS_WEIGHT, REFINE_MEAN_WEIGHT, REFINE_NEIGHBORS, RefineCell, RefineGrid,
+        SLASH_CANDIDATES, VERTICAL_CANDIDATES, aiss_cell_descriptor, blur_cell_grid,
+        cell_direction, dir_crunch, direction_prior_from, directional_ascii,
+        directional_candidates, distance_squared, dither_weights, external_bounds, match_image,
+        mean_region, nearest_glyph, ostromoukhov_coefficients, output_rows, top_glyph_candidates,
     };
     use crate::font_atlas::FontAtlas;
-    use crate::preprocess::{
-        CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, preprocess,
-        shape_density,
-    };
+    use crate::preprocess::{CELL_HEIGHT, CELL_WIDTH, WorkImage, cell_region_bounds, preprocess};
     use crate::tone::ToneMap;
 
     fn gradient_image(width: u32, height: u32) -> DynamicImage {
@@ -1139,6 +1314,10 @@ mod tests {
         }
     }
 
+    fn match_target(shape: [f32; 6], density: f32) -> MatchTarget {
+        MatchTarget { shape, density }
+    }
+
     /// 亮暗竖条对齐单元边界：右邻域比内部亮、左邻域更暗，外部样本逐分量不均匀。
     fn striped_image(width: u32, height: u32) -> DynamicImage {
         let mut image = RgbImage::new(width, height);
@@ -1169,61 +1348,8 @@ mod tests {
         DynamicImage::ImageRgb8(image)
     }
 
-    /// 中心一条强竖边，两侧亮度差足够大，方向项和 HVS 项都有信号。
-    fn strong_edge_image(width: u32, height: u32) -> DynamicImage {
-        let mut image = RgbImage::new(width, height);
-        for y in 0..height {
-            for x in 0..width {
-                let value = if x < width / 2 { 230 } else { 20 };
-                image.put_pixel(x, y, Rgb([value, value, value]));
-            }
-        }
-        DynamicImage::ImageRgb8(image)
-    }
-
     fn ascii_chars(art: &MatchedArt) -> Vec<char> {
         art.cells.iter().map(|cell| cell.ch).collect()
-    }
-
-    /// 只按顺序拼装现有元件：先 crunch，再等比缩放模长，最后选字。
-    fn reference_serial_chars(
-        image: &ProcessedImage,
-        atlas: &FontAtlas,
-        config: &MatchConfig,
-    ) -> Vec<char> {
-        let rows = output_rows(config.cols, image.width, image.height).unwrap();
-        let work = image
-            .resample(config.cols * CELL_WIDTH, rows * CELL_HEIGHT)
-            .unwrap();
-        let mut errors = vec![0.0_f32; (config.cols * rows) as usize];
-        let mut chars = Vec::new();
-        for row in 0..rows {
-            for col in 0..config.cols {
-                let index = (row * config.cols + col) as usize;
-                let direction = cell_direction(&work, config, col, row);
-                let enhanced = enhanced_samples(&work, col, row, config.dir_crunch);
-                let target = (shape_density(enhanced) + errors[index]).clamp(0.0, 1.0);
-                let cell = build_ascii_cell(
-                    image,
-                    atlas,
-                    config,
-                    CellPosition { col, row, rows },
-                    scale_to_density(enhanced, target),
-                    direction,
-                );
-                diffuse_scalar_error(
-                    config.cols,
-                    rows,
-                    col,
-                    row,
-                    target - cell.density,
-                    diffusion_weights(direction),
-                    &mut errors,
-                );
-                chars.push(cell.ch);
-            }
-        }
-        chars
     }
 
     #[test]
@@ -1272,9 +1398,10 @@ mod tests {
     }
 
     #[test]
-    fn diffusion_weights_fall_back_to_floyd_steinberg() {
-        let base = [7.0 / 16.0, 3.0 / 16.0, 5.0 / 16.0, 1.0 / 16.0];
-        assert_eq!(diffusion_weights(None), base);
+    fn dither_weights_fall_back_to_the_base_table() {
+        let base = ostromoukhov_coefficients(0.5);
+        assert_eq!(dither_weights(None, true, 0.5).0, base);
+
         let weak = CellDirection {
             edge: EdgeDirection {
                 normal_x: 1.0,
@@ -1283,7 +1410,7 @@ mod tests {
             },
             diffuses: true,
         };
-        assert_eq!(diffusion_weights(Some(weak)), base);
+        assert_eq!(dither_weights(Some(weak), true, 0.5).0, base);
 
         let gated = CellDirection {
             edge: EdgeDirection {
@@ -1293,37 +1420,66 @@ mod tests {
             },
             diffuses: false,
         };
-        assert_eq!(diffusion_weights(Some(gated)), base);
+        assert_eq!(dither_weights(Some(gated), true, 0.5).0, base);
     }
 
     #[test]
-    fn diffusion_weights_follow_a_vertical_edge() {
-        let weights = diffusion_weights(Some(CellDirection {
+    fn dither_weights_follow_a_vertical_edge() {
+        let (weights, offsets) = dither_weights(
+            Some(CellDirection {
+                edge: EdgeDirection {
+                    normal_x: 1.0,
+                    normal_y: 0.0,
+                    strength: 1.0,
+                },
+                diffuses: true,
+            }),
+            true,
+            0.5,
+        );
+        assert_eq!(offsets, [(1, 0), (-1, 1), (0, 1)]);
+        assert!(weights[0] < 1.0e-6, "right={}", weights[0]);
+        assert!(weights[2] > 1.0 / 3.0, "bottom={}", weights[2]);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn dither_weights_follow_a_horizontal_edge() {
+        let (weights, offsets) = dither_weights(
+            Some(CellDirection {
+                edge: EdgeDirection {
+                    normal_x: 0.0,
+                    normal_y: 1.0,
+                    strength: 1.0,
+                },
+                diffuses: true,
+            }),
+            true,
+            0.5,
+        );
+        assert_eq!(offsets, [(1, 0), (-1, 1), (0, 1)]);
+        assert!(weights[2] < 1.0e-6, "bottom={}", weights[2]);
+        assert!(weights[0] > 1.0 / 3.0, "forward={}", weights[0]);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn serpentine_scan_mirrors_the_forward_neighbor() {
+        let direction = Some(CellDirection {
             edge: EdgeDirection {
                 normal_x: 1.0,
                 normal_y: 0.0,
                 strength: 1.0,
             },
             diffuses: true,
-        }));
-        assert!(weights[0] < 1.0e-6, "right={}", weights[0]);
-        assert!(weights[2] > 5.0 / 16.0, "bottom={}", weights[2]);
-        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn diffusion_weights_follow_a_horizontal_edge() {
-        let weights = diffusion_weights(Some(CellDirection {
-            edge: EdgeDirection {
-                normal_x: 0.0,
-                normal_y: 1.0,
-                strength: 1.0,
-            },
-            diffuses: true,
-        }));
-        assert!(weights[2] < 1.0e-6, "bottom={}", weights[2]);
-        assert!(weights[0] > 7.0 / 16.0, "right={}", weights[0]);
-        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+        });
+        let (forward, forward_offsets) = dither_weights(direction, true, 0.5);
+        let (backward, backward_offsets) = dither_weights(direction, false, 0.5);
+        assert_eq!(forward_offsets[0], (1, 0));
+        assert_eq!(backward_offsets[0], (-1, 0));
+        assert!(forward[0] < 1.0e-6);
+        assert!(backward[0] < 1.0e-6);
+        assert!((forward[2] - backward[2]).abs() < 1.0e-6);
     }
 
     #[test]
@@ -1335,8 +1491,8 @@ mod tests {
         };
         for target in [[0.0; 6], [0.5; 6], [1.0; 6], [0.2, 0.8, 0.4, 0.1, 0.6, 0.3]] {
             assert_eq!(
-                nearest_glyph(atlas.ascii(), target, Some(&prior)).ch,
-                nearest_glyph(atlas.ascii(), target, None).ch
+                nearest_glyph(atlas.ascii(), match_target(target, 0.5), Some(&prior)).ch,
+                nearest_glyph(atlas.ascii(), match_target(target, 0.5), None).ch
             );
         }
     }
@@ -1349,7 +1505,7 @@ mod tests {
             candidates: HORIZONTAL_CANDIDATES,
             weight: 10.0,
         };
-        let glyph = nearest_glyph(atlas.ascii(), [0.5; 6], Some(&prior));
+        let glyph = nearest_glyph(atlas.ascii(), match_target([0.5; 6], 0.5), Some(&prior));
         assert!(HORIZONTAL_CANDIDATES.contains(&glyph.ch), "ch={}", glyph.ch);
     }
 
@@ -1395,9 +1551,9 @@ mod tests {
             .expect("归一化强度足够，仍应得到方向");
         assert!(!cell.diffuses);
         assert_eq!(
-            diffusion_weights(Some(cell)),
-            FLOYD_STEINBERG_WEIGHTS,
-            "低对比度单元应回退到各向同性 FS"
+            dither_weights(Some(cell), true, 0.5).0,
+            ostromoukhov_coefficients(0.5),
+            "低对比度单元应回退到基础系数"
         );
         // 先验只按归一化强度计算，低对比度图仍与 HEAD 一样获得先验。
         assert!(direction_prior_from(Some(cell.edge)).is_some());
@@ -1421,31 +1577,25 @@ mod tests {
             prior.weight
         );
 
-        let target = atlas
+        let glyph_a = atlas
             .ascii()
             .iter()
             .find(|glyph| glyph.ch == 'A')
-            .expect("atlas contains A")
-            .shape_vec;
+            .expect("atlas contains A");
         assert!(!VERTICAL_CANDIDATES.contains(&'A'));
-        assert_eq!(nearest_glyph(atlas.ascii(), target, Some(&prior)).ch, 'A');
+        let chosen = nearest_glyph(
+            atlas.ascii(),
+            match_target(glyph_a.shape_vec, glyph_a.density_norm),
+            Some(&prior),
+        );
+        assert_eq!(chosen.ch, 'A');
     }
 
     /// 方向先验只软性加罚，形状完全匹配的非候选字 'A' 仍应胜出。
     #[test]
-    fn build_ascii_cell_keeps_a_better_non_candidate_shape() {
-        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(10, 20, Rgb([128, 128, 128])));
-        let processed = preprocess(&image, 1.0, 0.0, ToneMap::default()).unwrap();
+    fn nearest_glyph_keeps_a_better_non_candidate_shape() {
         let atlas = FontAtlas::load().unwrap();
-        let work = WorkImage {
-            width: 10,
-            height: 20,
-            edge_scale: 1.0,
-            luma: vec![0.5; 200],
-            direction_cos2: vec![1.0; 200],
-            direction_sin2: vec![0.0; 200],
-            edge_strength: vec![1.0; 200],
-        };
+        let work = uniform_work_cell(1.0, 1.0);
         let config = MatchConfig {
             cols: 1,
             dir_crunch: 2.5,
@@ -1456,28 +1606,23 @@ mod tests {
             color: false,
             braille: false,
         };
-        let target = atlas
+        let glyph_a = atlas
             .ascii()
             .iter()
             .find(|glyph| glyph.ch == 'A')
-            .expect("atlas contains A")
-            .shape_vec;
+            .expect("atlas contains A");
 
         let direction = cell_direction(&work, &config, 0, 0);
-        let cell = build_ascii_cell(
-            &processed,
-            &atlas,
-            &config,
-            CellPosition {
-                col: 0,
-                row: 0,
-                rows: 1,
-            },
-            target,
-            direction,
+        let prior = direction_prior_from(direction.map(|direction| direction.edge));
+        assert_eq!(
+            nearest_glyph(
+                atlas.ascii(),
+                match_target(glyph_a.shape_vec, glyph_a.density_norm),
+                prior.as_ref()
+            )
+            .ch,
+            'A'
         );
-
-        assert_eq!(cell.ch, 'A');
     }
 
     #[test]
@@ -1560,11 +1705,16 @@ mod tests {
     fn top_glyph_candidates_start_with_the_best_and_keep_five() {
         let atlas = FontAtlas::load().unwrap();
         let target = [0.2, 0.8, 0.4, 0.1, 0.6, 0.3];
-        let candidates = top_glyph_candidates(atlas.ascii(), target, None, REFINE_CANDIDATE_COUNT);
+        let candidates = top_glyph_candidates(
+            atlas.ascii(),
+            match_target(target, 0.5),
+            None,
+            REFINE_CANDIDATE_COUNT,
+        );
         assert_eq!(candidates.len(), REFINE_CANDIDATE_COUNT);
         assert_eq!(
             atlas.ascii()[candidates[0].0].ch,
-            nearest_glyph(atlas.ascii(), target, None).ch
+            nearest_glyph(atlas.ascii(), match_target(target, 0.5), None).ch
         );
         assert!(
             candidates
@@ -1575,7 +1725,7 @@ mod tests {
 
     #[test]
     fn refine_matching_is_deterministic() {
-        let image = strong_edge_image(80, 80);
+        let image = striped_image(80, 40);
         let processed = preprocess(&image, 1.0, 0.25, ToneMap::Global).unwrap();
         let atlas = FontAtlas::load().unwrap();
         let first = match_image(&processed, &atlas, &refine_config()).unwrap();
@@ -1591,6 +1741,7 @@ mod tests {
                 ch: ' ',
                 shape_vec: [0.0; 6],
                 density,
+                density_norm: density,
                 bitmap: std::sync::Arc::from(vec![0_u8; (CELL_WIDTH * CELL_HEIGHT) as usize]),
             })
             .collect()
@@ -1635,7 +1786,7 @@ mod tests {
                 })
                 .collect();
             let chosen = (next_unit(&mut rng) * REFINE_CANDIDATE_COUNT as f32) as usize;
-            let render = fg_luminance * glyphs[candidates[chosen].0].density;
+            let render = fg_luminance * glyphs[candidates[chosen].0].density_norm;
             cells.push(RefineCell {
                 candidates,
                 chosen,
@@ -1761,7 +1912,7 @@ mod tests {
                         continue;
                     }
                     let (glyph_index, base_cost) = grid.cells[index].candidates[slot];
-                    let render = grid.cells[index].fg_luminance * glyphs[glyph_index].density;
+                    let render = grid.cells[index].fg_luminance * glyphs[glyph_index].density_norm;
                     let delta_render = render - grid.cells[index].render;
                     let incremental = (base_cost
                         - grid.cells[index].candidates[grid.cells[index].chosen].1)
@@ -1858,7 +2009,7 @@ mod tests {
     /// 强竖边给 HVS 邻域项足够信号；plain 路径必须完全不受 refine 影响。
     #[test]
     fn refine_can_change_a_glyph_without_affecting_plain() {
-        let image = strong_edge_image(80, 80);
+        let image = striped_image(80, 40);
         let processed = preprocess(&image, 1.0, 0.25, ToneMap::Global).unwrap();
         let atlas = FontAtlas::load().unwrap();
         let plain_config = config(false);
@@ -1998,95 +2149,6 @@ mod tests {
     }
 
     #[test]
-    fn density_scaling_keeps_direction_and_handles_zero_and_saturation() {
-        let raw = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
-        let scaled = scale_to_density(raw, 0.3);
-        assert!((shape_density(scaled) - 0.3).abs() < 1.0e-6);
-        for component in 1..6 {
-            assert!((scaled[component] / scaled[0] - raw[component] / raw[0]).abs() < 1.0e-6);
-        }
-
-        let zero = scale_to_density([0.0; 6], 0.25);
-        assert_eq!(zero, [0.25; 6]);
-        assert!((shape_density(zero) - 0.25).abs() < 1.0e-6);
-
-        let saturated = scale_to_density([0.9, 0.0, 0.0, 0.0, 0.0, 0.0], 1.0);
-        assert_eq!(saturated[0], 1.0);
-        assert!(
-            saturated
-                .iter()
-                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
-        );
-    }
-
-    #[test]
-    fn saturation_scales_every_component_by_one_factor() {
-        let raw = [0.75, 0.5, 0.25, 0.2, 0.1, 0.05];
-        let scaled = scale_to_density(raw, 1.0);
-        let cap = 1.0 / raw[0];
-        for (value, source) in scaled.into_iter().zip(raw) {
-            assert!((value - source * cap).abs() < 1.0e-6, "value={value}");
-            assert!((0.0..=1.0).contains(&value));
-        }
-        assert!((scaled[0] - 1.0).abs() < 1.0e-6);
-        let reached = shape_density(scaled);
-        assert!((reached - shape_density(raw) * cap).abs() < 1.0e-6);
-        assert!(reached < 1.0, "饱和后目标密度达不到，残差留给扩散");
-    }
-
-    #[test]
-    fn scaling_before_crunch_would_move_the_suppressed_direction() {
-        let raw = [0.3, 0.06, 0.3, 0.06, 0.3, 0.06];
-        let external = [0.0, 0.3, 0.0, 0.3, 0.0, 0.3];
-        let enhanced = dir_crunch(raw, external, 2.5);
-        let scaled = scale_to_density(enhanced, 0.35);
-        for component in 1..6 {
-            let ratio = scaled[component] / scaled[0];
-            let reference = enhanced[component] / enhanced[0];
-            assert!((ratio - reference).abs() < 1.0e-6, "ratio={ratio}");
-        }
-
-        let reordered = dir_crunch(scale_to_density(raw, 0.35), external, 2.5);
-        let reordered_ratio = reordered[1] / reordered[0];
-        let kept_ratio = scaled[1] / scaled[0];
-        assert!(
-            reordered_ratio > 2.0 * kept_ratio,
-            "先缩放再 crunch 会降低外部抑制：{reordered_ratio} vs {kept_ratio}"
-        );
-    }
-
-    #[test]
-    fn dither_rescales_the_crunched_shape_on_uneven_external_neighborhoods() {
-        let image = striped_image(40, 40);
-        let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
-        let atlas = FontAtlas::load().unwrap();
-        let mut conf = config(true);
-        conf.edge_weight = 0.0;
-
-        // 前置条件：确实有分量碰上了更亮的相邻外部，dir_crunch 的阈值会介入。
-        let rows = output_rows(conf.cols, processed.width, processed.height).unwrap();
-        let work = processed
-            .resample(conf.cols * CELL_WIDTH, rows * CELL_HEIGHT)
-            .unwrap();
-        let suppressed: usize = (0..rows)
-            .flat_map(|row| (0..conf.cols).map(move |col| (col, row)))
-            .map(|(col, row)| {
-                let raw = internal_samples(&work, col, row);
-                let external = external_samples(&work, col, row);
-                raw.into_iter()
-                    .zip(external)
-                    .filter(|(inside, outside)| outside > inside)
-                    .count()
-            })
-            .sum();
-        assert!(suppressed > 0, "样本没有跨过外部阈值，测不到顺序差异");
-
-        let art = match_image(&processed, &atlas, &conf).unwrap();
-        let actual: Vec<char> = art.cells.iter().map(|cell| cell.ch).collect();
-        assert_eq!(actual, reference_serial_chars(&processed, &atlas, &conf));
-    }
-
-    #[test]
     fn serial_dither_uses_structure_aware_weights() {
         let image = vertical_stripes(80, 40);
         let processed = preprocess(&image, 1.0, 0.25, ToneMap::Global).unwrap();
@@ -2102,10 +2164,6 @@ mod tests {
             braille: false,
         };
 
-        let art = match_image(&processed, &atlas, &conf).unwrap();
-        let actual: Vec<char> = art.cells.iter().map(|cell| cell.ch).collect();
-        assert_eq!(actual, reference_serial_chars(&processed, &atlas, &conf));
-
         let rows = output_rows(conf.cols, processed.width, processed.height).unwrap();
         let work = processed
             .resample(conf.cols * CELL_WIDTH, rows * CELL_HEIGHT)
@@ -2114,26 +2172,36 @@ mod tests {
             .flat_map(|row| (0..conf.cols).map(move |col| (col, row)))
             .filter(|&(col, row)| {
                 cell_direction(&work, &conf, col, row).is_some_and(|direction| {
-                    diffusion_weights(Some(direction)) != FLOYD_STEINBERG_WEIGHTS
+                    dither_weights(Some(direction), true, 0.5).0 != ostromoukhov_coefficients(0.5)
                 })
             })
             .count();
         assert!(anisotropic_cells > 0, "竖条纹没有触发结构感知扩散");
+        assert_eq!(
+            match_image(&processed, &atlas, &conf).unwrap().cells.len(),
+            (rows * 8) as usize
+        );
     }
 
     #[test]
-    fn mono_foreground_uses_cell_luminance_instead_of_white() {
+    fn mono_foreground_compensates_glyph_density() {
         let atlas = FontAtlas::load().unwrap();
-        for (value, expected) in [(0_u8, 64_u8), (128, 160), (255, 255)] {
+        let config = config(false);
+        for value in [0_u8, 128, 255] {
             let image =
                 DynamicImage::ImageRgb8(RgbImage::from_pixel(10, 20, Rgb([value, value, value])));
             let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
-            let art = match_image(&processed, &atlas, &config(false)).unwrap();
-            assert!(
-                art.cells.iter().all(|cell| cell.fg_color == [expected; 3]),
-                "value={value}, fg={:?}",
-                art.cells[0].fg_color
-            );
+            let rows = output_rows(config.cols, processed.width, processed.height).unwrap();
+            let art = match_image(&processed, &atlas, &config).unwrap();
+            let cell = &art.cells[0];
+            let target = processed.cell_luminance(config.cols, rows, 0, 0);
+            let expected = if cell.density > 1.0e-6 {
+                (target / cell.density).clamp(0.25, 1.0)
+            } else {
+                1.0
+            };
+            let expected = (expected * 255.0).round() as u8;
+            assert_eq!(cell.fg_color[0], expected, "value={value}");
         }
     }
 
@@ -2157,14 +2225,16 @@ mod tests {
     }
 
     #[test]
-    fn braille_dither_uses_bayer_thresholds_per_dot() {
+    fn braille_dither_uses_blue_noise_thresholds_per_dot() {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 40, Rgb([128, 128, 128])));
         let processed = preprocess(&image, 1.0, 0.0, ToneMap::Global).unwrap();
         let atlas = FontAtlas::load().unwrap();
         let mut dithered = config(true);
         dithered.braille = true;
         let art = match_image(&processed, &atlas, &dithered).unwrap();
-        assert!(art.cells.iter().all(|cell| cell.density == 0.5));
+        let mean = art.cells.iter().map(|cell| cell.density).sum::<f32>() / art.cells.len() as f32;
+        assert!((mean - 0.5).abs() < 0.15, "mean={mean}");
+        assert!(art.cells.iter().any(|cell| cell.density != 0.5));
 
         let mut plain = dithered.clone();
         plain.dither = false;

@@ -13,13 +13,20 @@ const CELL_PIXELS: usize = (CELL_WIDTH * CELL_HEIGHT) as usize;
 pub struct CharGlyph {
     pub ch: char,
     pub shape_vec: [f32; 6],
+    /// 原始覆盖率，单位是 0..max_ink。
     pub density: f32,
+    /// 相对最密字形的覆盖率，0..1。
+    pub density_norm: f32,
     pub bitmap: Arc<[u8]>,
 }
 
 pub struct FontAtlas {
     ascii: Vec<CharGlyph>,
     braille_bitmaps: Vec<Arc<[u8]>>,
+    /// 6 维共用的全局缩放系数；目标是原始子块覆盖率除以它。
+    shape_scale: f32,
+    /// 单字最大原始覆盖率，用于把 density 映射到 0..1。
+    max_ink: f32,
     /// AISS 描述子只在首次使用时构建，plain、dither、refine、braille 路径不付这份成本。
     aiss_descriptors: OnceLock<Vec<Vec<f32>>>,
 }
@@ -35,8 +42,57 @@ pub const BRAILLE_LAYOUT: [(usize, usize); 8] = [
     (3, 1),
 ];
 
-/// 2x4 Bayer 阈值矩阵。行、列分别对应盲文点位行和列。
-pub const BRAILLE_BAYER: [[u8; 2]; 4] = [[0, 4], [2, 6], [1, 5], [3, 7]];
+/// 16x16 void-and-cluster 蓝噪声阈值矩阵；按图像坐标平铺，替代 2x4 Bayer。
+pub const BRAILLE_BLUE_NOISE: [[u8; 16]; 16] = [
+    [
+        0, 217, 35, 55, 247, 1, 199, 90, 68, 209, 2, 114, 33, 241, 188, 87,
+    ],
+    [
+        169, 131, 96, 204, 160, 125, 43, 225, 157, 51, 250, 78, 213, 62, 120, 207,
+    ],
+    [
+        73, 228, 14, 115, 77, 216, 177, 15, 118, 192, 94, 174, 141, 10, 159, 47,
+    ],
+    [
+        31, 147, 183, 238, 26, 53, 101, 143, 233, 24, 132, 40, 237, 184, 92, 243,
+    ],
+    [
+        194, 105, 59, 166, 133, 193, 251, 80, 58, 167, 222, 69, 108, 20, 219, 123,
+    ],
+    [
+        3, 252, 38, 83, 224, 4, 161, 36, 208, 111, 5, 198, 136, 57, 152, 79,
+    ],
+    [
+        179, 126, 214, 153, 106, 66, 122, 182, 91, 242, 154, 84, 253, 170, 211, 45,
+    ],
+    [
+        146, 95, 16, 185, 32, 245, 205, 17, 145, 54, 27, 189, 41, 11, 110, 232,
+    ],
+    [
+        61, 203, 75, 235, 135, 46, 156, 76, 215, 130, 230, 103, 127, 202, 88, 29,
+    ],
+    [
+        246, 162, 49, 117, 172, 93, 226, 112, 22, 178, 71, 168, 56, 227, 140, 186,
+    ],
+    [
+        6, 104, 220, 21, 200, 7, 63, 190, 248, 97, 8, 210, 150, 18, 74, 119,
+    ],
+    [
+        42, 138, 181, 81, 254, 134, 164, 34, 144, 48, 236, 116, 37, 255, 173, 218,
+    ],
+    [
+        89, 239, 64, 158, 39, 107, 234, 85, 121, 201, 163, 82, 191, 102, 60, 155,
+    ],
+    [
+        28, 196, 12, 124, 212, 70, 195, 13, 221, 65, 19, 137, 223, 9, 128, 206,
+    ],
+    [
+        113, 171, 100, 231, 25, 175, 50, 149, 180, 98, 240, 44, 72, 176, 229, 52,
+    ],
+    [
+        249, 67, 148, 187, 86, 139, 109, 244, 30, 129, 165, 197, 151, 99, 23, 142,
+    ],
+];
 
 impl FontAtlas {
     pub fn load() -> Result<Self> {
@@ -57,23 +113,43 @@ impl FontAtlas {
                 ch,
                 shape_vec: raw_shape_vector(&bitmap),
                 density,
+                density_norm: 0.0,
                 bitmap: Arc::from(bitmap),
             });
         }
 
-        normalize_shape_vectors(&mut ascii);
+        let max_ink = ascii
+            .iter()
+            .map(|glyph| glyph.density)
+            .fold(0.0_f32, f32::max);
+        for glyph in &mut ascii {
+            glyph.density_norm = glyph.density / max_ink.max(1.0e-6);
+        }
+        let shape_scale = normalize_shape_vectors(&mut ascii);
         let braille_bitmaps = (0..=255)
             .map(|bits| Arc::<[u8]>::from(render_braille_bitmap(bits)))
             .collect();
         Ok(Self {
             ascii,
             braille_bitmaps,
+            shape_scale,
+            max_ink,
             aiss_descriptors: OnceLock::new(),
         })
     }
 
     pub fn ascii(&self) -> &[CharGlyph] {
         &self.ascii
+    }
+
+    /// 字形向量与目标单元共用的覆盖率缩放系数。
+    pub fn shape_scale(&self) -> f32 {
+        self.shape_scale
+    }
+
+    /// 单字最大原始覆盖率，对应 density_norm = 1。
+    pub fn max_ink(&self) -> f32 {
+        self.max_ink
     }
 
     /// 与 `ascii` 下标一一对应的 AISS 描述子，首次调用时才计算。
@@ -171,20 +247,21 @@ fn raw_shape_vector(bitmap: &[u8]) -> [f32; 6] {
     shape
 }
 
-fn normalize_shape_vectors(glyphs: &mut [CharGlyph]) {
-    let mut maxima = [0.0_f32; 6];
+fn normalize_shape_vectors(glyphs: &mut [CharGlyph]) -> f32 {
+    let mut maximum = 0.0_f32;
     for glyph in glyphs.iter() {
-        for (maximum, value) in maxima.iter_mut().zip(glyph.shape_vec) {
-            *maximum = maximum.max(value);
+        for value in glyph.shape_vec {
+            maximum = maximum.max(value);
         }
     }
-    for glyph in glyphs {
-        for (value, maximum) in glyph.shape_vec.iter_mut().zip(maxima) {
-            if maximum > 1.0e-6 {
+    if maximum > 1.0e-6 {
+        for glyph in glyphs {
+            for value in &mut glyph.shape_vec {
                 *value /= maximum;
             }
         }
     }
+    maximum
 }
 
 pub fn braille_char(bits: u8) -> char {
@@ -234,20 +311,26 @@ mod tests {
     }
 
     #[test]
-    fn space_is_empty_and_shape_components_are_normalized_by_dimension() {
+    fn shape_components_share_one_global_scale() {
         let atlas = FontAtlas::load().unwrap();
         let space = &atlas.ascii()[0];
         assert_eq!(space.shape_vec, [0.0; 6]);
         assert_eq!(space.density, 0.0);
 
-        for component in 0..6 {
-            let maximum = atlas
-                .ascii()
-                .iter()
-                .map(|glyph| glyph.shape_vec[component])
-                .fold(0.0_f32, f32::max);
-            assert!((maximum - 1.0).abs() < 1.0e-5);
-        }
+        let maximum = atlas
+            .ascii()
+            .iter()
+            .flat_map(|glyph| glyph.shape_vec)
+            .fold(0.0_f32, f32::max);
+        assert!((maximum - 1.0).abs() < 1.0e-5);
+
+        // 顶部子块本身更稀疏，共享缩放后不应再被放大到 1。
+        let top_max = atlas
+            .ascii()
+            .iter()
+            .map(|glyph| glyph.shape_vec[0])
+            .fold(0.0_f32, f32::max);
+        assert!(top_max < 0.9, "top_max={top_max}");
     }
 
     #[test]
