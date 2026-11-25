@@ -451,13 +451,11 @@ def character_stats(path: Path) -> dict[str, float]:
 
 
 def density_mae_normalized(reference: np.ndarray, compared: np.ndarray) -> float:
-    """按单元平均覆墨率归一化；不能先逐像素除以 max_ink，否则亮字形会被裁顶。"""
+    """先求 10x20 单元均值，再按 max_ink 归一化；避免逐像素裁顶压暗亮字形。"""
     rows = compared.shape[0] // CELL_HEIGHT
     reference_cells = reference.reshape(rows, CELL_HEIGHT, WIDTH, CELL_WIDTH).mean(axis=(1, 3))
     compared_cells = compared.reshape(rows, CELL_HEIGHT, WIDTH, CELL_WIDTH).mean(axis=(1, 3))
-    return float(
-        np.mean(np.abs(reference_cells / 255.0 - compared_cells / 255.0 / MAX_INK))
-    )
+    return float(np.mean(np.abs(reference_cells / 255.0 - compared_cells / 255.0 / MAX_INK)))
 
 
 def evaluate(binary: Path, sample: Path, mode_name: str, mode_flags: list[str]) -> dict:
@@ -497,8 +495,7 @@ def evaluate(binary: Path, sample: Path, mode_name: str, mode_flags: list[str]) 
     compared_unit = compared / 255.0
     density_diff, density_mae = density_metrics(reference_unit, compared_unit)
 
-    normalized = np.clip(compared / MAX_INK, 0.0, 255.0)
-    blurred_normalized = hvs_blur(normalized)
+    blurred_normalized = np.clip(blurred_compared / MAX_INK, 0.0, 255.0)
     density_mae_norm = density_mae_normalized(reference, compared)
 
     metrics = {
@@ -674,7 +671,7 @@ def write_baseline_doc(
         "- DoG corr：目标图与渲染图 DoG 图（Gaussian σ=1.0 减 σ=2.0）的 Pearson 相关系数。",
         "- density diff：两图全局均值之差的绝对值。",
         "- density MAE：按 10x20 像素块取均值后，120 x rows 单元网格的平均绝对误差。",
-        f"- SSIM_norm@σ5、FSIM_norm@σ5、density MAE norm：渲染图先按字体最大覆墨率 `MAX_INK={MAX_INK}` 线性缩放并裁到 0..255，再计算同名模糊指标，消除 4 倍物理覆墨上限造成的尺度偏差。",
+        f"- SSIM_norm@σ5、FSIM_norm@σ5：渲染图先做 σ5 模糊，再按 `clip(blurred / MAX_INK, 0, 255)` 缩放，`MAX_INK={MAX_INK}`，计算同名指标。\n- density MAE norm：先按 10x20 单元求均值，再除以 `MAX_INK` 与目标单元均值比较；不逐像素裁顶。",
         "- corr@σ5：目标图与渲染图 HVS 模糊后的 Pearson 相关系数，不受线性明度缩放影响。",
         "- unique chars：实际使用的不同字符数 / 95。",
         "- vertical stem：`! | i 1 : '` 六类竖线字符的占比，用于监控竖条纹塌缩。",

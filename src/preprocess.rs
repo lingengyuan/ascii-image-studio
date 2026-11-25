@@ -70,6 +70,16 @@ pub fn preprocess(
     edge_weight: f32,
     tone_map: ToneMap,
 ) -> Result<ProcessedImage> {
+    preprocess_with_rgf(image, contrast, edge_weight, tone_map, false)
+}
+
+pub fn preprocess_with_rgf(
+    image: &DynamicImage,
+    contrast: f32,
+    edge_weight: f32,
+    tone_map: ToneMap,
+    rgf: bool,
+) -> Result<ProcessedImage> {
     ensure!(
         contrast.is_finite() && contrast > 0.0,
         "contrast 必须是有限正数"
@@ -103,6 +113,9 @@ pub fn preprocess(
     let display_luma = luma.clone();
 
     apply_tone_map(&mut luma, width, height, tone_map, contrast)?;
+    if rgf {
+        luma = rolling_guidance(&luma, width, height);
+    }
 
     let (normal_x, normal_y, edge_strength, signed_dog, edge_scale) = if edge_weight > 0.0 {
         edge_maps(&luma, width, height)
@@ -229,6 +242,64 @@ fn smooth_edge_directions(
         normal_x[index] = theta.cos();
         normal_y[index] = theta.sin();
     }
+}
+
+/// 3 轮 Rolling Guidance Filter：按原图引导平滑，压掉小于半格宽的高频纹理，
+/// 大轮廓因灰度差被保留。σ_s=4.5 px，σ_r=0.1，窗口半径 3。
+fn rolling_guidance(values: &[f32], width: u32, height: u32) -> Vec<f32> {
+    const SIGMA_S: f32 = 4.5;
+    const SIGMA_R: f32 = 0.1;
+    const RADIUS: isize = 3;
+    const ITERATIONS: usize = 3;
+    const LUT_SIZE: usize = 1024;
+
+    let mut spatial = Vec::new();
+    for dy in -RADIUS..=RADIUS {
+        for dx in -RADIUS..=RADIUS {
+            let distance2 = (dx * dx + dy * dy) as f32;
+            spatial.push((-0.5 * distance2 / (SIGMA_S * SIGMA_S)).exp());
+        }
+    }
+    let range_lut: Vec<f32> = (0..LUT_SIZE)
+        .map(|index| {
+            let difference = index as f32 / (LUT_SIZE - 1) as f32;
+            (-0.5 * (difference / SIGMA_R).powi(2)).exp()
+        })
+        .collect();
+
+    let mut guide = gaussian_blur(values, width, height, SIGMA_S);
+    for _ in 0..ITERATIONS {
+        let mut next = vec![0.0_f32; values.len()];
+        for y in 0..height as isize {
+            for x in 0..width as isize {
+                let index = y as usize * width as usize + x as usize;
+                let center = values[index];
+                let mut weighted = 0.0;
+                let mut weight_sum = 0.0;
+                let mut tap = 0;
+                for dy in -RADIUS..=RADIUS {
+                    let ny = (y + dy).clamp(0, height as isize - 1) as usize;
+                    for dx in -RADIUS..=RADIUS {
+                        let nx = (x + dx).clamp(0, width as isize - 1) as usize;
+                        let neighbor = ny * width as usize + nx;
+                        let difference = (values[neighbor] - center).abs().min(1.0);
+                        let lut_index = (difference * (LUT_SIZE - 1) as f32) as usize;
+                        let weight = spatial[tap] * range_lut[lut_index];
+                        weighted += weight * guide[neighbor];
+                        weight_sum += weight;
+                        tap += 1;
+                    }
+                }
+                next[index] = if weight_sum > 1.0e-12 {
+                    weighted / weight_sum
+                } else {
+                    guide[index]
+                };
+            }
+        }
+        guide = next;
+    }
+    guide
 }
 
 /// 有符号 DoG 非锐化掩模：亮侧更亮、暗侧更暗。
@@ -538,7 +609,7 @@ mod tests {
     use crate::tone::ToneMap;
 
     use super::{
-        ProcessedImage, box_blur, direction_smooth, gaussian_blur, preprocess,
+        ProcessedImage, box_blur, direction_smooth, gaussian_blur, preprocess, rolling_guidance,
         smooth_edge_directions,
     };
 
@@ -563,6 +634,42 @@ mod tests {
         assert!((processed.display_luma[0] - expected).abs() < 1.0e-6);
         assert!((processed.cell_luminance(1, 1, 0, 0) - expected).abs() < 1.0e-6);
         assert!((processed.luma[0] - expected).abs() > 1.0e-3);
+    }
+
+    #[test]
+    fn rolling_guidance_preserves_flat_and_step_but_smooths_texture() {
+        let flat = vec![0.4_f32; 40 * 40];
+        let smoothed = rolling_guidance(&flat, 40, 40);
+        assert!(smoothed.iter().all(|value| (*value - 0.4).abs() < 1e-5));
+
+        let mut step = vec![0.2_f32; 40 * 40];
+        for y in 0..40 {
+            for x in 20..40 {
+                step[y * 40 + x] = 0.8;
+            }
+        }
+        let smoothed = rolling_guidance(&step, 40, 40);
+        let left = smoothed[20 * 40 + 5];
+        let right = smoothed[20 * 40 + 35];
+        assert!((left - 0.2).abs() < 0.03, "left={left}");
+        assert!((right - 0.8).abs() < 0.03, "right={right}");
+
+        let mut checker = vec![0.0_f32; 40 * 40];
+        for y in 0..40 {
+            for x in 0..40 {
+                checker[y * 40 + x] = if (x + y) % 2 == 0 { 0.2 } else { 0.8 };
+            }
+        }
+        let variance = |values: &[f32]| {
+            let mean = values.iter().sum::<f32>() / values.len() as f32;
+            values
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f32>()
+                / values.len() as f32
+        };
+        let smoothed = rolling_guidance(&checker, 40, 40);
+        assert!(variance(&smoothed) < variance(&checker) * 0.5);
     }
 
     #[test]

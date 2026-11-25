@@ -41,7 +41,11 @@ pub struct Cli {
     #[arg(short = 'e', long, default_value_t = 0.25, value_parser = unit_interval_finite_f32)]
     pub edge_weight: f32,
 
-    /// 启用抖动：ASCII 用 Floyd-Steinberg，盲文用 2x4 Bayer 有序抖动
+    /// 启用 3 轮 RGF 纹理预平滑：σ_s=4.5 px，σ_r=0.1
+    #[arg(long)]
+    pub rgf: bool,
+
+    /// 启用抖动：ASCII 用 Ostromoukhov 三邻域扩散，盲文用 16x16 蓝噪声
     #[arg(long)]
     pub dither: bool,
 
@@ -148,6 +152,7 @@ mod tests {
         assert_eq!(cli.edge_weight, 0.25);
         assert!(!cli.refine);
         assert!(!cli.aiss);
+        assert!(!cli.rgf);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use ascii_image_studio::cli::{Cli, resolve_width, terminal_columns};
 use ascii_image_studio::font_atlas::FontAtlas;
 use ascii_image_studio::matcher::{MatchConfig, match_image};
-use ascii_image_studio::preprocess::{ProcessedImage, preprocess};
+use ascii_image_studio::preprocess::{ProcessedImage, preprocess_with_rgf};
 use ascii_image_studio::renderer::{OutputKind, render};
 use clap::Parser;
 use image::{GrayImage, ImageFormat, Luma, Rgb, RgbImage};
@@ -30,7 +30,8 @@ fn run(cli: Cli) -> Result<()> {
     let width = resolve_width(cli.width, cli.output.as_deref(), terminal);
     let image = image::open(&cli.input_image)
         .with_context(|| format!("无法读取输入图片 {}", cli.input_image.display()))?;
-    let processed = preprocess(&image, cli.contrast, cli.edge_weight, cli.tone_map)?;
+    let processed =
+        preprocess_with_rgf(&image, cli.contrast, cli.edge_weight, cli.tone_map, cli.rgf)?;
     if let Some(path) = &cli.dump_processed {
         dump_processed(path, &processed)?;
     }

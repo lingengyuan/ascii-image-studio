@@ -156,9 +156,12 @@ const OSTROMOUKHOV_WEIGHTS: [[u16; 3]; 128] = [
     [4, 1, 1],
 ];
 
-const REFINE_SWEEPS: usize = 3;
-const REFINE_CANDIDATE_COUNT: usize = 5;
-const REFINE_HVS_WEIGHT: f32 = 15.0;
+const REFINE_SWEEPS: usize = 2;
+const REFINE_CANDIDATE_COUNT: usize = 16;
+const HVS_SIGMA_PIXELS: f32 = 3.5;
+const HVS_REACH: isize = 10;
+/// 像素 HVS 残差项权重。
+const REFINE_PIXEL_WEIGHT: f32 = 0.2;
 const REFINE_MEAN_WEIGHT: f32 = 3.0;
 const REFINE_EDGE_WEIGHT: f32 = 1.0;
 
@@ -178,7 +181,6 @@ const SHAPE_WEIGHT: f32 = 1.0;
 const DENSITY_WEIGHT: f32 = 15.0;
 /// 小权重把候选拉回本格目标均值；全局均值项仍防止整图漂移。
 const REFINE_DENSITY_WEIGHT: f32 = 0.20;
-const HVS_KERNEL: [f32; 3] = [0.25, 0.5, 0.25];
 const REFINE_NEIGHBORS: [(isize, isize, f32, f32); 4] = [
     (1, 0, CELL_WIDTH as f32, 0.0),
     (-1, 1, -(CELL_WIDTH as f32), CELL_HEIGHT as f32),
@@ -400,12 +402,11 @@ fn match_ascii_serial(
     rows: u32,
     cell_count: usize,
 ) -> Vec<AsciiCell> {
-    let mut cells = Vec::with_capacity(cell_count);
+    let mut cells: Vec<Option<AsciiCell>> = (0..cell_count).map(|_| None).collect();
     let mut errors = vec![0.0_f32; cell_count];
 
     for row in 0..rows {
-        // 单元级测试：蛇形换向会让三邻域系数失配，SSIM_norm 下降约 0.1，暂保留栅格扫描。
-        let forward = true;
+        let forward = row % 2 == 0;
         for step in 0..config.cols {
             let col = if forward {
                 step
@@ -434,10 +435,13 @@ fn match_ascii_serial(
                 offsets,
                 &mut errors,
             );
-            cells.push(cell);
+            cells[index] = Some(cell);
         }
     }
     cells
+        .into_iter()
+        .map(|cell| cell.expect("每个单元都应被填充"))
+        .collect()
 }
 
 /// 棋盘式候选重选只改字符选择：初始解仍是 6D 最近字，位图和前景色不动。
@@ -452,7 +456,10 @@ fn match_ascii_refine(
     let glyphs = atlas.ascii();
     let cols = config.cols as usize;
     let row_count = rows as usize;
+    let mono = !config.color;
+    let mut pixel = PixelHvs::new(work, glyphs, atlas.max_ink());
     let mut cells = Vec::with_capacity(cell_count);
+    let mut initial_mean = 0.0;
 
     for row in 0..rows {
         for col in 0..config.cols {
@@ -461,62 +468,69 @@ fn match_ascii_refine(
             let prior = direction_prior_from(direction.map(|direction| direction.edge));
             let candidates =
                 top_glyph_candidates(glyphs, match_target, prior.as_ref(), REFINE_CANDIDATE_COUNT);
-            let fg_color = foreground_color(
-                image,
-                config,
-                CellPosition { col, row, rows },
-                glyphs[candidates[0].0].density_norm,
-            );
-            let fg_luminance = color_luma(fg_color);
+            let display = image.cell_luminance(config.cols, rows, col, row);
+            let color_fg = if mono {
+                [255; 3]
+            } else {
+                image.cell_highlight_color(config.cols, rows, col, row)
+            };
+            let density = glyphs[candidates[0].0].density_norm;
+            let fg_luminance = if mono {
+                if density > 1.0e-6 {
+                    (display / density).clamp(0.25, 1.0)
+                } else {
+                    1.0
+                }
+            } else {
+                color_luma(color_fg)
+            };
             let target = match_target.density;
-            let render = fg_luminance * glyphs[candidates[0].0].density_norm;
+            let render = fg_luminance * density;
+            pixel.add_cell(col, row, candidates[0].0, fg_luminance);
+            initial_mean += render;
             cells.push(RefineCell {
                 candidates,
                 chosen: 0,
                 direction,
-                fg_color,
+                fg_color: color_fg,
                 fg_luminance,
+                mono,
+                display,
                 target,
                 render,
             });
         }
     }
-
-    let target_means: Vec<f32> = cells.iter().map(|cell| cell.target).collect();
-    let render_means: Vec<f32> = cells.iter().map(|cell| cell.render).collect();
-    let blurred_target = blur_cell_grid(&target_means, cols, row_count);
-    let blurred_render = blur_cell_grid(&render_means, cols, row_count);
-    let hvs_error = blurred_target
-        .iter()
-        .zip(&target_means)
-        .zip(blurred_render.iter().zip(&render_means))
-        .map(|((target_blur, target), (render_blur, render))| {
-            (target_blur - target) - (render_blur - render)
-        })
-        .collect();
-    let initial_mean = render_means.iter().sum::<f32>() / cell_count as f32;
-    let global_sum = render_means.iter().sum();
+    initial_mean /= cell_count.max(1) as f32;
+    let global_sum: f32 = cells.iter().map(|cell| cell.render).sum();
 
     let mut grid = RefineGrid {
         glyphs,
         cols,
         rows: row_count,
         cells,
-        blurred_target,
-        blurred_render,
-        hvs_error,
+        pixel,
         initial_mean,
         global_sum,
     };
 
+    // 同组单元相隔 3 列/3 行：30x40 足迹不重叠，可在组内并行决策。
     for _ in 0..REFINE_SWEEPS {
-        for parity in 0..2_u32 {
-            for row in 0..rows {
-                for col in 0..config.cols {
-                    if (col + row) % 2 != parity {
-                        continue;
-                    }
-                    grid.refine_cell(row as usize * cols + col as usize);
+        for group_row in 0..3_u32 {
+            for group_col in 0..4_u32 {
+                let indices: Vec<usize> = (0..rows)
+                    .flat_map(|row| {
+                        (0..config.cols)
+                            .filter(move |col| col % 4 == group_col && row % 3 == group_row)
+                            .map(move |col| row as usize * cols + col as usize)
+                    })
+                    .collect();
+                let choices: Vec<RefineChoice> = indices
+                    .par_iter()
+                    .filter_map(|&index| grid.choose_cell(index))
+                    .collect();
+                for choice in choices {
+                    grid.apply_choice(choice);
                 }
             }
         }
@@ -526,9 +540,19 @@ fn match_ascii_refine(
         .iter()
         .map(|cell| {
             let glyph = &grid.glyphs[cell.candidates[cell.chosen].0];
+            let fg_color = if cell.mono {
+                let fg = if glyph.density_norm > 1.0e-6 {
+                    (cell.display / glyph.density_norm).clamp(0.25, 1.0)
+                } else {
+                    1.0
+                };
+                [(fg * 255.0).round().clamp(0.0, 255.0) as u8; 3]
+            } else {
+                cell.fg_color
+            };
             AsciiCell {
                 ch: glyph.ch,
-                fg_color: cell.fg_color,
+                fg_color,
                 density: glyph.density_norm,
                 bitmap: glyph.bitmap.clone(),
             }
@@ -567,8 +591,125 @@ struct RefineCell {
     direction: Option<CellDirection>,
     fg_color: [u8; 3],
     fg_luminance: f32,
+    mono: bool,
+    display: f32,
     target: f32,
     render: f32,
+}
+
+/// 像素级 HVS 残差：目标与当前渲染都先做 sigma=3.5 的高斯模糊，
+/// 每个字形预计算带外扩边界的模糊足迹，候选替换只在足迹内增量更新。
+struct PixelHvs {
+    padded_width: usize,
+    footprint_width: usize,
+    footprint_height: usize,
+    residual: Vec<f32>,
+    footprints: Vec<Vec<f32>>,
+}
+
+impl PixelHvs {
+    fn new(work: &WorkImage, glyphs: &[CharGlyph], max_ink: f32) -> Self {
+        let width = work.width as usize;
+        let height = work.height as usize;
+        let kernel = gaussian_kernel(HVS_SIGMA_PIXELS);
+        let radius = HVS_REACH;
+        let footprint_width = CELL_WIDTH as usize + radius as usize * 2;
+        let footprint_height = CELL_HEIGHT as usize + radius as usize * 2;
+        let target = blur_values(&work.luma, width, height, &kernel, true);
+        let padded_width = width + radius as usize * 2;
+        let padded_height = height + radius as usize * 2;
+        let mut residual = vec![0.0_f32; padded_width * padded_height];
+        for y in 0..height {
+            for x in 0..width {
+                residual[(y + radius as usize) * padded_width + x + radius as usize] =
+                    -target[y * width + x];
+            }
+        }
+        let footprints: Vec<Vec<f32>> = glyphs
+            .iter()
+            .map(|glyph| {
+                let mut canvas = vec![0.0_f32; footprint_width * footprint_height];
+                for y in 0..CELL_HEIGHT as usize {
+                    for x in 0..CELL_WIDTH as usize {
+                        let value = f32::from(glyph.bitmap[y * CELL_WIDTH as usize + x]) / 255.0;
+                        canvas[(y + radius as usize) * footprint_width + x + radius as usize] =
+                            value / max_ink;
+                    }
+                }
+                blur_values(&canvas, footprint_width, footprint_height, &kernel, false)
+            })
+            .collect();
+        Self {
+            padded_width,
+            footprint_width,
+            footprint_height,
+            residual,
+            footprints,
+        }
+    }
+
+    fn add_cell(&mut self, col: u32, row: u32, glyph: usize, fg: f32) {
+        let (origin_x, origin_y) = self.origin(col, row);
+        for fy in 0..self.footprint_height {
+            let row_start = (origin_y as usize + fy) * self.padded_width + origin_x as usize;
+            for fx in 0..self.footprint_width {
+                self.residual[row_start + fx] +=
+                    fg * self.footprints[glyph][fy * self.footprint_width + fx];
+            }
+        }
+    }
+
+    fn delta(
+        &self,
+        col: u32,
+        row: u32,
+        old_glyph: usize,
+        old_fg: f32,
+        new_glyph: usize,
+        new_fg: f32,
+    ) -> f32 {
+        let (origin_x, origin_y) = self.origin(col, row);
+        let mut delta = 0.0;
+        for fy in 0..self.footprint_height {
+            let row_start = (origin_y as usize + fy) * self.padded_width + origin_x as usize;
+            for fx in 0..self.footprint_width {
+                let index = fy * self.footprint_width + fx;
+                let change = new_fg * self.footprints[new_glyph][index]
+                    - old_fg * self.footprints[old_glyph][index];
+                let error = self.residual[row_start + fx];
+                delta += 2.0 * error * change + change * change;
+            }
+        }
+        delta
+    }
+
+    fn apply(
+        &mut self,
+        col: u32,
+        row: u32,
+        old_glyph: usize,
+        old_fg: f32,
+        new_glyph: usize,
+        new_fg: f32,
+    ) {
+        let (origin_x, origin_y) = self.origin(col, row);
+        for fy in 0..self.footprint_height {
+            let row_start = (origin_y as usize + fy) * self.padded_width + origin_x as usize;
+            for fx in 0..self.footprint_width {
+                let index = fy * self.footprint_width + fx;
+                let change = new_fg * self.footprints[new_glyph][index]
+                    - old_fg * self.footprints[old_glyph][index];
+                self.residual[row_start + fx] += change;
+            }
+        }
+    }
+
+    fn origin(&self, col: u32, row: u32) -> (isize, isize) {
+        (
+            col as isize * CELL_WIDTH as isize,
+            row as isize * CELL_HEIGHT as isize,
+        )
+    }
 }
 
 struct RefineGrid<'a> {
@@ -576,19 +717,27 @@ struct RefineGrid<'a> {
     cols: usize,
     rows: usize,
     cells: Vec<RefineCell>,
-    blurred_target: Vec<f32>,
-    blurred_render: Vec<f32>,
-    /// 去均值后的 HVS 残差：目标局部起伏减渲染局部起伏。
-    hvs_error: Vec<f32>,
+    pixel: PixelHvs,
     initial_mean: f32,
     global_sum: f32,
 }
 
+struct RefineChoice {
+    index: usize,
+    slot: usize,
+    fg: f32,
+    render: f32,
+}
+
 impl RefineGrid<'_> {
-    fn refine_cell(&mut self, index: usize) {
+    fn choose_cell(&self, index: usize) -> Option<RefineChoice> {
         let current_slot = self.cells[index].chosen;
         let current_base = self.cells[index].candidates[current_slot].1;
         let current_render = self.cells[index].render;
+        let old_glyph = self.cells[index].candidates[current_slot].0;
+        let old_fg = self.candidate_fg(index, old_glyph);
+        let col = (index % self.cols) as u32;
+        let row = (index / self.cols) as u32;
         let mut best_slot = current_slot;
         let mut best_score = current_base;
 
@@ -597,10 +746,14 @@ impl RefineGrid<'_> {
                 continue;
             }
             let (glyph_index, base_cost) = self.cells[index].candidates[slot];
-            let render = self.cells[index].fg_luminance * self.glyphs[glyph_index].density_norm;
+            let fg = self.candidate_fg(index, glyph_index);
+            let render = fg * self.glyphs[glyph_index].density_norm;
             let delta_render = render - current_render;
             let score = base_cost
-                + REFINE_HVS_WEIGHT * self.hvs_delta(index, delta_render)
+                + REFINE_PIXEL_WEIGHT
+                    * self
+                        .pixel
+                        .delta(col, row, old_glyph, old_fg, glyph_index, fg)
                 + REFINE_MEAN_WEIGHT * self.mean_delta(delta_render)
                 + REFINE_DENSITY_WEIGHT * self.density_delta(index, render)
                 + REFINE_EDGE_WEIGHT * self.edge_delta(index, current_render, render);
@@ -610,50 +763,46 @@ impl RefineGrid<'_> {
             }
         }
 
-        if best_slot != current_slot {
-            let glyph_index = self.cells[index].candidates[best_slot].0;
-            let render = self.cells[index].fg_luminance * self.glyphs[glyph_index].density_norm;
-            self.accept(index, best_slot, render);
+        if best_slot == current_slot {
+            return None;
         }
+        let glyph_index = self.cells[index].candidates[best_slot].0;
+        let fg = self.candidate_fg(index, glyph_index);
+        Some(RefineChoice {
+            index,
+            slot: best_slot,
+            fg,
+            render: fg * self.glyphs[glyph_index].density_norm,
+        })
     }
 
-    fn accept(&mut self, index: usize, slot: usize, render: f32) {
-        let delta_render = render - self.cells[index].render;
-        self.cells[index].chosen = slot;
-        self.cells[index].render = render;
-
-        let cols = self.cols;
-        let rows = self.rows;
-        let blurred_render = &mut self.blurred_render;
-        for_each_hvs_influence(index, cols, rows, |out, weight| {
-            blurred_render[out] += weight * delta_render;
-        });
-
-        let blurred_target = &self.blurred_target;
-        let blurred_render = &self.blurred_render;
-        let cells = &self.cells;
-        let hvs_error = &mut self.hvs_error;
-        for_each_hvs_influence(index, cols, rows, |out, _| {
-            hvs_error[out] = (blurred_target[out] - cells[out].target)
-                - (blurred_render[out] - cells[out].render);
-        });
-
-        self.global_sum += delta_render;
+    fn apply_choice(&mut self, choice: RefineChoice) {
+        let index = choice.index;
+        let old_slot = self.cells[index].chosen;
+        let old_glyph = self.cells[index].candidates[old_slot].0;
+        let old_fg = self.candidate_fg(index, old_glyph);
+        let current_render = self.cells[index].render;
+        let glyph_index = self.cells[index].candidates[choice.slot].0;
+        let col = (index % self.cols) as u32;
+        let row = (index / self.cols) as u32;
+        self.pixel
+            .apply(col, row, old_glyph, old_fg, glyph_index, choice.fg);
+        self.cells[index].chosen = choice.slot;
+        self.cells[index].render = choice.render;
+        self.global_sum += choice.render - current_render;
     }
 
-    /// 单格渲染均值变化对 3x3 邻域 HVS 平方误差的增量。
-    fn hvs_delta(&self, index: usize, delta_render: f32) -> f32 {
-        let mut delta = 0.0;
-        for_each_hvs_influence(index, self.cols, self.rows, |out, weight| {
-            let de_meaned_delta = if out == index {
-                weight * delta_render - delta_render
-            } else {
-                weight * delta_render
-            };
-            let error = self.hvs_error[out];
-            delta += (error - de_meaned_delta).powi(2) - error.powi(2);
-        });
-        delta
+    fn candidate_fg(&self, index: usize, glyph_index: usize) -> f32 {
+        let cell = &self.cells[index];
+        if !cell.mono {
+            return cell.fg_luminance;
+        }
+        let density = self.glyphs[glyph_index].density_norm;
+        if density > 1.0e-6 {
+            (cell.display / density).clamp(0.25, 1.0)
+        } else {
+            1.0
+        }
     }
 
     fn mean_delta(&self, delta_render: f32) -> f32 {
@@ -674,7 +823,6 @@ impl RefineGrid<'_> {
     }
 
     /// 本格参与的全部边能：四条出边，加上四个上游邻格指向本格的入边。
-    /// 全局目标只按出边求和，所以每条边在这里恰好出现一次。
     fn incident_edge_energy(&self, index: usize, render: f32) -> f32 {
         let cell = &self.cells[index];
         let Some(direction) = cell.direction.filter(|direction| direction.diffuses) else {
@@ -720,6 +868,66 @@ impl RefineGrid<'_> {
     }
 }
 
+fn gaussian_kernel(sigma: f32) -> Vec<f32> {
+    let radius = HVS_REACH;
+    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
+    let mut sum = 0.0;
+    for offset in -radius..=radius {
+        let weight = (-0.5 * (offset as f32 / sigma).powi(2)).exp();
+        kernel.push(weight);
+        sum += weight;
+    }
+    for weight in &mut kernel {
+        *weight /= sum;
+    }
+    kernel
+}
+
+fn blur_values(
+    values: &[f32],
+    width: usize,
+    height: usize,
+    kernel: &[f32],
+    clamp_edges: bool,
+) -> Vec<f32> {
+    let radius = (kernel.len() / 2) as isize;
+    let sample = |x: isize, y: isize, data: &[f32]| -> f32 {
+        if clamp_edges {
+            let cx = x.clamp(0, width as isize - 1) as usize;
+            let cy = y.clamp(0, height as isize - 1) as usize;
+            data[cy * width + cx]
+        } else if (0..width as isize).contains(&x) && (0..height as isize).contains(&y) {
+            data[y as usize * width + x as usize]
+        } else {
+            0.0
+        }
+    };
+
+    let mut horizontal = vec![0.0_f32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0;
+            for (index, weight) in kernel.iter().enumerate() {
+                let offset = index as isize - radius;
+                sum += weight * sample(x as isize + offset, y as isize, values);
+            }
+            horizontal[y * width + x] = sum;
+        }
+    }
+    let mut output = vec![0.0_f32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0;
+            for (index, weight) in kernel.iter().enumerate() {
+                let offset = index as isize - radius;
+                sum += weight * sample(x as isize, y as isize + offset, &horizontal);
+            }
+            output[y * width + x] = sum;
+        }
+    }
+    output
+}
+
 /// 边权只取源格方向；目标格方向只贡献强度。
 fn edge_pair_energy(
     source: CellDirection,
@@ -731,62 +939,6 @@ fn edge_pair_energy(
     let dot = (offset_x * source.edge.normal_x + offset_y * source.edge.normal_y) / length;
     let along = 1.0 - dot * dot;
     along * source.edge.strength * target.edge.strength
-}
-
-/// 3x3 可分离 [1,2,1]/4 模糊，边界按复制处理。
-fn blur_cell_grid(values: &[f32], cols: usize, rows: usize) -> Vec<f32> {
-    let mut horizontal = vec![0.0; values.len()];
-    for row in 0..rows {
-        for col in 0..cols {
-            let left = values[row * cols + col.saturating_sub(1)];
-            let center = values[row * cols + col];
-            let right = values[row * cols + (col + 1).min(cols - 1)];
-            horizontal[row * cols + col] = (left + 2.0 * center + right) * 0.25;
-        }
-    }
-
-    let mut output = vec![0.0; values.len()];
-    for row in 0..rows {
-        for col in 0..cols {
-            let up = horizontal[row.saturating_sub(1) * cols + col];
-            let center = horizontal[row * cols + col];
-            let down = horizontal[(row + 1).min(rows - 1) * cols + col];
-            output[row * cols + col] = (up + 2.0 * center + down) * 0.25;
-        }
-    }
-    output
-}
-
-/// 单格变化只影响模糊核覆盖的输出格；夹取边界时一个输出格可能合并多个核偏移。
-fn for_each_hvs_influence(
-    index: usize,
-    cols: usize,
-    rows: usize,
-    mut visit: impl FnMut(usize, f32),
-) {
-    let row = index / cols;
-    let col = index % cols;
-    for output_row in row.saturating_sub(1)..=(row + 1).min(rows - 1) {
-        let row_weight = clamped_blur_weight(output_row, row, rows);
-        for output_col in col.saturating_sub(1)..=(col + 1).min(cols - 1) {
-            let weight = row_weight * clamped_blur_weight(output_col, col, cols);
-            if weight > 0.0 {
-                visit(output_row * cols + output_col, weight);
-            }
-        }
-    }
-}
-
-fn clamped_blur_weight(output: usize, source: usize, len: usize) -> f32 {
-    let mut weight = 0.0;
-    for (kernel_index, weight_component) in HVS_KERNEL.into_iter().enumerate() {
-        let offset = kernel_index as isize - 1;
-        let sampled = (output as isize + offset).clamp(0, len as isize - 1) as usize;
-        if sampled == source {
-            weight += weight_component;
-        }
-    }
-    weight
 }
 
 /// `enhanced` 已做过方向增强，这里不再 crunch，抖动路径才能与无抖动路径同形。
@@ -1263,11 +1415,9 @@ mod tests {
     use image::{DynamicImage, Rgb, RgbImage};
 
     use super::{
-        BACKSLASH_CANDIDATES, CellDirection, CharGlyph, DIFFUSION_RAMP_START,
-        DIRECTION_PRIOR_WEIGHT, DirectionPrior, EdgeDirection, HORIZONTAL_CANDIDATES, MatchConfig,
-        MatchTarget, MatchedArt, REFINE_CANDIDATE_COUNT, REFINE_DENSITY_WEIGHT, REFINE_EDGE_WEIGHT,
-        REFINE_HVS_WEIGHT, REFINE_MEAN_WEIGHT, REFINE_NEIGHBORS, RefineCell, RefineGrid,
-        SLASH_CANDIDATES, VERTICAL_CANDIDATES, aiss_cell_descriptor, blur_cell_grid,
+        BACKSLASH_CANDIDATES, CellDirection, DIFFUSION_RAMP_START, DIRECTION_PRIOR_WEIGHT,
+        DirectionPrior, EdgeDirection, HORIZONTAL_CANDIDATES, MatchConfig, MatchTarget, MatchedArt,
+        REFINE_CANDIDATE_COUNT, SLASH_CANDIDATES, VERTICAL_CANDIDATES, aiss_cell_descriptor,
         cell_direction, dir_crunch, direction_prior_from, directional_ascii,
         directional_candidates, distance_squared, dither_weights, external_bounds, match_image,
         mean_region, nearest_glyph, ostromoukhov_coefficients, output_rows, top_glyph_candidates,
@@ -1733,280 +1883,6 @@ mod tests {
         assert_eq!(ascii_chars(&first), ascii_chars(&second));
     }
 
-    /// 5 个密度档位足够覆盖候选渲染值；形状向量不参与 refine 目标函数。
-    fn synthetic_glyphs() -> Vec<CharGlyph> {
-        [0.0, 0.25, 0.5, 0.75, 1.0]
-            .into_iter()
-            .map(|density| CharGlyph {
-                ch: ' ',
-                shape_vec: [0.0; 6],
-                density,
-                density_norm: density,
-                bitmap: std::sync::Arc::from(vec![0_u8; (CELL_WIDTH * CELL_HEIGHT) as usize]),
-            })
-            .collect()
-    }
-
-    fn next_unit(seed: &mut u64) -> f32 {
-        *seed = seed
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        ((*seed >> 40) as u32 as f32) / (1_u32 << 24) as f32
-    }
-
-    fn synthetic_direction(seed: &mut u64) -> Option<CellDirection> {
-        if next_unit(seed) < 1.0 / 3.0 {
-            return None;
-        }
-        let angle = next_unit(seed) * std::f32::consts::TAU;
-        Some(CellDirection {
-            edge: EdgeDirection {
-                normal_x: angle.cos(),
-                normal_y: angle.sin(),
-                strength: 0.05 + 0.95 * next_unit(seed),
-            },
-            diffuses: next_unit(seed) >= 0.25,
-        })
-    }
-
-    fn synthetic_grid<'a>(
-        glyphs: &'a [CharGlyph],
-        cols: usize,
-        rows: usize,
-        seed: u64,
-    ) -> RefineGrid<'a> {
-        let mut rng = seed;
-        let mut cells = Vec::with_capacity(cols * rows);
-        for _ in 0..cols * rows {
-            let fg_luminance = 0.3 + 0.7 * next_unit(&mut rng);
-            let candidates: Vec<(usize, f32)> = (0..REFINE_CANDIDATE_COUNT)
-                .map(|_| {
-                    let glyph = (next_unit(&mut rng) * glyphs.len() as f32) as usize;
-                    (glyph, next_unit(&mut rng))
-                })
-                .collect();
-            let chosen = (next_unit(&mut rng) * REFINE_CANDIDATE_COUNT as f32) as usize;
-            let render = fg_luminance * glyphs[candidates[chosen].0].density_norm;
-            cells.push(RefineCell {
-                candidates,
-                chosen,
-                direction: synthetic_direction(&mut rng),
-                fg_color: [0; 3],
-                fg_luminance,
-                target: next_unit(&mut rng),
-                render,
-            });
-        }
-        let targets: Vec<f32> = cells.iter().map(|cell| cell.target).collect();
-        let renders: Vec<f32> = cells.iter().map(|cell| cell.render).collect();
-        let blurred_target = blur_cell_grid(&targets, cols, rows);
-        let blurred_render = blur_cell_grid(&renders, cols, rows);
-        let hvs_error = blurred_target
-            .iter()
-            .zip(&targets)
-            .zip(blurred_render.iter().zip(&renders))
-            .map(|((target_blur, target), (render_blur, render))| {
-                (target_blur - target) - (render_blur - render)
-            })
-            .collect();
-        RefineGrid {
-            glyphs,
-            cols,
-            rows,
-            cells,
-            blurred_target,
-            blurred_render,
-            hvs_error,
-            initial_mean: renders.iter().sum::<f32>() / renders.len() as f32,
-            global_sum: renders.iter().sum(),
-        }
-    }
-
-    /// 独立按目标定义求和：遍历每个源格的四条出边。
-    fn full_edge_energy(grid: &RefineGrid, renders: &[f32]) -> f32 {
-        let mut energy = 0.0;
-        for index in 0..grid.cells.len() {
-            let Some(source) = grid.cells[index]
-                .direction
-                .filter(|direction| direction.diffuses)
-            else {
-                continue;
-            };
-            let col = index % grid.cols;
-            let row = index / grid.cols;
-            for (delta_col, delta_row, offset_x, offset_y) in REFINE_NEIGHBORS {
-                let neighbor_col = col as isize + delta_col;
-                let neighbor_row = row as isize + delta_row;
-                if !(0..grid.cols as isize).contains(&neighbor_col)
-                    || !(0..grid.rows as isize).contains(&neighbor_row)
-                {
-                    continue;
-                }
-                let neighbor_index = neighbor_row as usize * grid.cols + neighbor_col as usize;
-                let Some(target) = grid.cells[neighbor_index]
-                    .direction
-                    .filter(|direction| direction.diffuses)
-                else {
-                    continue;
-                };
-                let length = offset_x.hypot(offset_y);
-                let dot =
-                    (offset_x * source.edge.normal_x + offset_y * source.edge.normal_y) / length;
-                energy += (1.0 - dot * dot)
-                    * source.edge.strength
-                    * target.edge.strength
-                    * (renders[index] - renders[neighbor_index]).powi(2);
-            }
-        }
-        energy
-    }
-
-    fn full_objective(grid: &RefineGrid, slots: &[usize], renders: &[f32]) -> f32 {
-        let base: f32 = grid
-            .cells
-            .iter()
-            .zip(slots)
-            .map(|(cell, slot)| cell.candidates[*slot].1)
-            .sum();
-        let blurred = blur_cell_grid(renders, grid.cols, grid.rows);
-        let hvs: f32 = (0..renders.len())
-            .map(|index| {
-                let expected = grid.blurred_target[index] - grid.cells[index].target;
-                let actual = blurred[index] - renders[index];
-                (expected - actual).powi(2)
-            })
-            .sum();
-        let mean = renders.iter().sum::<f32>() / renders.len() as f32;
-        let mean_penalty = (mean - grid.initial_mean).powi(2);
-        let density: f32 = grid
-            .cells
-            .iter()
-            .zip(renders)
-            .map(|(cell, render)| (render - cell.target).powi(2))
-            .sum();
-        base + REFINE_HVS_WEIGHT * hvs
-            + REFINE_MEAN_WEIGHT * mean_penalty
-            + REFINE_DENSITY_WEIGHT * density
-            + REFINE_EDGE_WEIGHT * full_edge_energy(grid, renders)
-    }
-
-    /// 候选增量必须等于完整目标函数的前后差；旧实现漏掉入边，边界格会失配。
-    #[test]
-    fn refine_candidate_delta_matches_full_objective_recomputation() {
-        let glyphs = synthetic_glyphs();
-        for case in 0..24_u64 {
-            let cols = 1 + (case as usize % 5);
-            let rows = 1 + (case as usize / 5 % 4);
-            let grid = synthetic_grid(
-                &glyphs,
-                cols,
-                rows,
-                case.wrapping_mul(0x9E37_79B9_7F4A_7C15),
-            );
-            let slots: Vec<usize> = grid.cells.iter().map(|cell| cell.chosen).collect();
-            let renders: Vec<f32> = grid.cells.iter().map(|cell| cell.render).collect();
-            let before = full_objective(&grid, &slots, &renders);
-            for index in 0..grid.cells.len() {
-                for slot in 0..grid.cells[index].candidates.len() {
-                    if slot == grid.cells[index].chosen {
-                        continue;
-                    }
-                    let (glyph_index, base_cost) = grid.cells[index].candidates[slot];
-                    let render = grid.cells[index].fg_luminance * glyphs[glyph_index].density_norm;
-                    let delta_render = render - grid.cells[index].render;
-                    let incremental = (base_cost
-                        - grid.cells[index].candidates[grid.cells[index].chosen].1)
-                        + REFINE_HVS_WEIGHT * grid.hvs_delta(index, delta_render)
-                        + REFINE_MEAN_WEIGHT * grid.mean_delta(delta_render)
-                        + REFINE_DENSITY_WEIGHT * grid.density_delta(index, render)
-                        + REFINE_EDGE_WEIGHT
-                            * grid.edge_delta(index, grid.cells[index].render, render);
-                    let mut after_slots = slots.clone();
-                    after_slots[index] = slot;
-                    let mut after_renders = renders.clone();
-                    after_renders[index] = render;
-                    let full_delta = full_objective(&grid, &after_slots, &after_renders) - before;
-                    assert!(
-                        (incremental - full_delta).abs() <= 2.0e-4,
-                        "case={case} cols={cols} rows={rows} index={index} slot={slot}: \
-                         incremental={incremental} full={full_delta}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// 复现 review 反例：2x1 网格最后一行最后一列只有入边，旧实现按 0 计算。
-    #[test]
-    fn refine_rejects_last_column_candidate_whose_incoming_edge_rises() {
-        let glyphs = synthetic_glyphs();
-        let direction = CellDirection {
-            edge: EdgeDirection {
-                normal_x: 0.0,
-                normal_y: 1.0,
-                strength: 1.0,
-            },
-            diffuses: true,
-        };
-        let cells = (0..2)
-            .map(|_| RefineCell {
-                // 密度 0.25 渲染 0.1；密度 0.5 渲染 0.2。基代价下降 0.03。
-                candidates: vec![(1, 0.5), (2, 0.47)],
-                chosen: 0,
-                direction: Some(direction),
-                fg_color: [102; 3],
-                fg_luminance: 0.4,
-                target: 0.1,
-                render: 0.1,
-            })
-            .collect();
-        let targets = [0.1_f32; 2];
-        let renders = [0.1_f32; 2];
-        let blurred_target = blur_cell_grid(&targets, 2, 1);
-        let blurred_render = blur_cell_grid(&renders, 2, 1);
-        let mut grid = RefineGrid {
-            glyphs: &glyphs,
-            cols: 2,
-            rows: 1,
-            cells,
-            blurred_target,
-            blurred_render,
-            hvs_error: vec![0.0; 2],
-            initial_mean: 0.1,
-            global_sum: 0.2,
-        };
-
-        let edge_delta = grid.edge_delta(1, 0.1, 0.2);
-        assert!(
-            (edge_delta - 0.01).abs() <= 1.0e-6,
-            "入边增量应为 0.01，实际 {edge_delta}"
-        );
-        let slots: Vec<usize> = grid.cells.iter().map(|cell| cell.chosen).collect();
-        let renders: Vec<f32> = grid.cells.iter().map(|cell| cell.render).collect();
-        let before = full_objective(&grid, &slots, &renders);
-        let mut after_slots = slots.clone();
-        after_slots[1] = 1;
-        let mut after_renders = renders.clone();
-        after_renders[1] = 0.2;
-        let full_delta = full_objective(&grid, &after_slots, &after_renders) - before;
-        let expected = -0.03
-            + REFINE_HVS_WEIGHT * 0.00125
-            + REFINE_MEAN_WEIGHT * 0.0025
-            + REFINE_DENSITY_WEIGHT * 0.01
-            + 0.01;
-        assert!(
-            (full_delta - expected).abs() <= 1.0e-6,
-            "完整目标增量应为 {expected}，实际 {full_delta}"
-        );
-
-        grid.refine_cell(1);
-        assert_eq!(
-            grid.cells[1].chosen, 0,
-            "基代价更低但会抬高完整目标的候选必须被拒绝"
-        );
-    }
-
-    /// 强竖边给 HVS 邻域项足够信号；plain 路径必须完全不受 refine 影响。
     #[test]
     fn refine_can_change_a_glyph_without_affecting_plain() {
         let image = striped_image(80, 40);
