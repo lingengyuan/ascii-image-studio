@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use ascii_image_studio::cli::{Cli, resolve_width, terminal_columns};
+use ascii_image_studio::cli::{Charset, Cli, resolve_width, terminal_columns};
 use ascii_image_studio::font_atlas::FontAtlas;
 use ascii_image_studio::matcher::{MatchConfig, match_image};
 use ascii_image_studio::preprocess::{ProcessedImage, preprocess_with_rgf};
@@ -30,6 +30,20 @@ fn run(cli: Cli) -> Result<()> {
     let width = resolve_width(cli.width, cli.output.as_deref(), terminal);
     let image = image::open(&cli.input_image)
         .with_context(|| format!("无法读取输入图片 {}", cli.input_image.display()))?;
+    if cli.braille && !matches!(cli.charset, Charset::Ascii | Charset::Braille) {
+        anyhow::bail!("--braille 不能与 --charset blocks/sextant 同时使用");
+    }
+    let charset = if cli.braille {
+        Charset::Braille
+    } else {
+        cli.charset
+    };
+    if cli.dual_color && !matches!(charset, Charset::Blocks | Charset::Sextant) {
+        anyhow::bail!("--dual-color 需要 --charset blocks 或 sextant");
+    }
+    if matches!(charset, Charset::Blocks | Charset::Sextant) && !cli.dual_color {
+        anyhow::bail!("--charset blocks/sextant 需要 --dual-color");
+    }
     let processed =
         preprocess_with_rgf(&image, cli.contrast, cli.edge_weight, cli.tone_map, cli.rgf)?;
     if let Some(path) = &cli.dump_processed {
@@ -46,8 +60,10 @@ fn run(cli: Cli) -> Result<()> {
         dither: cli.dither,
         refine: cli.refine,
         aiss: cli.aiss,
+        charset,
+        dual_color: cli.dual_color,
         color: cli.color,
-        braille: cli.braille,
+        braille: cli.braille || charset == Charset::Braille,
     };
     let art = match_image(&processed, &atlas, &config)?;
     render(&art, output_kind, cli.output.as_deref())

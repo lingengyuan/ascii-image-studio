@@ -86,10 +86,20 @@ pub fn render_plain(art: &MatchedArt) -> String {
 }
 
 pub fn render_ansi(art: &MatchedArt) -> String {
-    let mut output = String::from("\u{1b}[48;2;0;0;0m");
+    let mut output = String::new();
+    let mut current_bg: Option<[u8; 3]> = None;
     for row in 0..art.rows {
         for col in 0..art.cols {
             let cell = &art.cells[cell_index(art, col, row)];
+            if current_bg != Some(cell.bg_color) {
+                write!(
+                    output,
+                    "\u{1b}[48;2;{};{};{}m",
+                    cell.bg_color[0], cell.bg_color[1], cell.bg_color[2]
+                )
+                .expect("writing to String cannot fail");
+                current_bg = Some(cell.bg_color);
+            }
             if cell.ch == ' ' {
                 output.push(' ');
             } else {
@@ -124,12 +134,12 @@ pub fn render_png(art: &MatchedArt) -> Result<RgbImage> {
             for y in 0..cell.bitmap.len() / 10 {
                 for x in 0..10 {
                     let coverage = u16::from(cell.bitmap[y * 10 + x]);
-                    if coverage == 0 {
-                        continue;
-                    }
-                    let color = cell
-                        .fg_color
-                        .map(|channel| ((u16::from(channel) * coverage + 127) / 255) as u8);
+                    let color = std::array::from_fn(|channel| {
+                        ((u16::from(cell.fg_color[channel]) * coverage
+                            + u16::from(cell.bg_color[channel]) * (255 - coverage)
+                            + 127)
+                            / 255) as u8
+                    });
                     image.put_pixel(col * 10 + x as u32, row * 20 + y as u32, Rgb(color));
                 }
             }

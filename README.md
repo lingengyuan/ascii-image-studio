@@ -31,8 +31,10 @@ cargo build --release
 | `--dither` | 关闭 | ASCII 用 Ostromoukhov 变量系数三邻域扩散；盲文用 16x16 蓝噪声阈值 |
 | `--refine` | 关闭 | 网格级 top-5 局部搜索；与 `--dither`、`--braille` 互斥 |
 | `--aiss` | 关闭 | AISS 边缘描述子重排 6D 前 10 名；弱边缘或空白单元回退纯 6D，与 `--dither`、`--braille`、`--refine` 互斥 |
-| `--color` | 关闭 | 保留原图高亮区域颜色 |
-| `--braille` | 关闭 | 使用 2x4 盲文点阵字符 |
+| `--charset` | `ascii` | `ascii`、`braille`、`blocks`、`sextant`；后两者需配合 `--dual-color` |
+| `--dual-color` | 关闭 | 对 blocks/sextant 做精确双色掩码匹配，逐格求最优前景/背景色；与 `--dither`、`--refine`、`--aiss`、`--braille` 互斥 |
+| `--color` | 关闭 | 保留原图高亮区域颜色；双色模式下保留真实前景/背景 RGB |
+| `--braille` | 关闭 | `--charset braille` 的别名 |
 
 ## 处理说明
 
@@ -44,6 +46,9 @@ cargo build --release
 - `--dither` 在 ASCII 上用 Ostromoukhov 变量系数（按单元亮度查表）扩散到前向、左下、正下三邻域，强边时沿边权重增大；单元级蛇形扫描会让指标下降约 0.1，未启用。盲文用 16x16 void-and-cluster 蓝噪声阈值。
 - `--refine` 以 6D 匹配为初值，用 3x3 单元 HVS、全局密度漂移和沿边密度平滑做 3 轮棋盘重选；不使用误差扩散。
 - `--aiss` 首次使用时为每个字符构建对数极坐标边缘直方图；字形覆盖图与目标单元都经过同一套 10x20 DoG 边缘算子。单元边缘的绝对平均幅值达到门限时，在 6D 前 10 名内按直方图 L1 距离重排；弱边缘或空白单元保持纯 6D。
+- `--charset blocks` 使用 32 个 U+2580–U+259F 半块/象限/阴影块；`sextant` 使用 60 个 U+1FB00–U+1FB3B 2x3 六分块、44 个 U+1FB3C–U+1FB67 斜切楔形块，另加空格、全块和 U+1FB68–U+1FB6F 三角形块，共 114 个字形。位图按 10x20 程序化生成，PNG 不依赖字体是否含这些字符；终端显示需要覆盖 U+1FB00–U+1FB6F 的等宽字体，缺字时会出现豆腐块。
+- `--dual-color` 在原始 RGB 工作分辨率上逐格遍历字符集全部掩码：掩码内像素均值作前景色，掩码外均值作背景色，再用 Redmean 感知误差选最小重构误差；按行并行，输出确定。加 `--color` 保留 RGB，否则转灰度前景/背景。
+- ANSI 在背景色变化时输出 `48;2;R;G;B`；PNG 按 `coverage * fg + (1 - coverage) * bg` 合成，不再固定纯黑底。
 - 盲文没有字形方向选择，`--dir-crunch` 只影响 ASCII 字符匹配。
 - 透明像素先合成到黑底。
 
@@ -52,9 +57,9 @@ cargo build --release
 | 扩展名 | 内容 |
 | --- | --- |
 | `.txt` | 纯文本，无 ANSI 转义序列 |
-| `.ans` | 24-bit ANSI，黑底前景色 |
-| `.png` | 黑底无损图片，每字符格 10x20 像素 |
-| 终端 | 24-bit ANSI，黑底前景色 |
+| `.ans` | 24-bit ANSI，前景色 + 可变成分背景色 |
+| `.png` | 无损图片，每字符格 10x20 像素，支持双色前景/背景 |
+| 终端 | 24-bit ANSI，前景色 + 可变成分背景色 |
 
 盲文 PNG 按标准 2x4 点阵位图绘制，不依赖字体盲文字形。
 

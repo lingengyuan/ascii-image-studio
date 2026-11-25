@@ -1,11 +1,19 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::tone::ToneMap;
 
 pub const DEFAULT_WIDTH: u32 = 160;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Charset {
+    Ascii,
+    Braille,
+    Blocks,
+    Sextant,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -16,6 +24,14 @@ pub const DEFAULT_WIDTH: u32 = 160;
 pub struct Cli {
     /// 输入图片路径
     pub input_image: PathBuf,
+
+    /// 字符集：ascii、braille、blocks 或 sextant；sextant 终端显示需字体覆盖 U+1FB00–U+1FB6F
+    #[arg(long, value_enum, default_value = "ascii")]
+    pub charset: Charset,
+
+    /// 对 blocks/sextant 使用精确双色掩码匹配
+    #[arg(long, conflicts_with_all = ["dither", "refine", "aiss", "braille"])]
+    pub dual_color: bool,
 
     /// 输出字符列数；终端输出默认取窗口宽度，文件输出默认 160
     #[arg(short = 'w', long, value_parser = positive_u32)]
@@ -139,13 +155,15 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, DEFAULT_WIDTH, resolve_width};
+    use super::{Charset, Cli, DEFAULT_WIDTH, resolve_width};
     use crate::tone::ToneMap;
 
     #[test]
     fn defaults_match_cli_contract() {
         let cli = Cli::try_parse_from(["tool", "input.png"]).unwrap();
         assert_eq!(cli.width, None);
+        assert_eq!(cli.charset, Charset::Ascii);
+        assert!(!cli.dual_color);
         assert_eq!(cli.contrast, 1.3);
         assert_eq!(cli.tone_map, ToneMap::Clahe);
         assert_eq!(cli.dir_crunch, 2.5);

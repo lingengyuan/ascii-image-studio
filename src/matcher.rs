@@ -4,6 +4,7 @@ use anyhow::{Result, ensure};
 use rayon::prelude::*;
 
 use crate::aiss;
+use crate::cli::Charset;
 use crate::font_atlas::{BRAILLE_BLUE_NOISE, BRAILLE_LAYOUT, CharGlyph, FontAtlas, braille_char};
 use crate::preprocess::{
     CELL_HEIGHT, CELL_WIDTH, ProcessedImage, WorkImage, cell_region_bounds, color_luma,
@@ -209,6 +210,8 @@ pub struct MatchConfig {
     pub dither: bool,
     pub refine: bool,
     pub aiss: bool,
+    pub charset: Charset,
+    pub dual_color: bool,
     pub color: bool,
     pub braille: bool,
 }
@@ -217,6 +220,7 @@ pub struct MatchConfig {
 pub struct AsciiCell {
     pub ch: char,
     pub fg_color: [u8; 3],
+    pub bg_color: [u8; 3],
     pub density: f32,
     pub bitmap: Arc<[u8]>,
 }
@@ -256,7 +260,9 @@ pub fn match_image(
     let cell_count = usize::try_from(u64::from(config.cols) * u64::from(rows))
         .map_err(|_| anyhow::anyhow!("字符网格尺寸溢出"))?;
     let work = image.resample(width, height)?;
-    let cells = if config.braille {
+    let cells = if config.dual_color {
+        match_dual_color(image, atlas, config, rows)?
+    } else if config.braille {
         match_braille(image, atlas, config, &work, rows)
     } else if config.dither {
         match_ascii_serial(image, atlas, config, &work, rows, cell_count)
@@ -362,6 +368,7 @@ fn match_ascii_aiss(
                             CellPosition { col, row, rows },
                             glyph.density_norm,
                         ),
+                        bg_color: [0, 0, 0],
                         density: glyph.density_norm,
                         bitmap: glyph.bitmap.clone(),
                     }
@@ -554,6 +561,7 @@ fn match_ascii_refine(
             AsciiCell {
                 ch: glyph.ch,
                 fg_color,
+                bg_color: [0, 0, 0],
                 density: glyph.density_norm,
                 bitmap: glyph.bitmap.clone(),
             }
@@ -1000,9 +1008,128 @@ fn build_ascii_cell(
     AsciiCell {
         ch: glyph.ch,
         fg_color: foreground_color(image, config, position, glyph.density_norm),
+        bg_color: [0, 0, 0],
         density: glyph.density_norm,
         bitmap: glyph.bitmap.clone(),
     }
+}
+
+/// blocks/sextant 双色匹配：fg 取掩码内像素均值，bg 取掩码外像素均值，
+/// 再用 Redmean 感知误差在该字符集全部掩码中选最小重构误差。
+fn match_dual_color(
+    image: &ProcessedImage,
+    atlas: &FontAtlas,
+    config: &MatchConfig,
+    rows: u32,
+) -> Result<Vec<AsciiCell>> {
+    let glyphs = match config.charset {
+        Charset::Blocks => atlas.blocks(),
+        Charset::Sextant => atlas.sextants(),
+        _ => anyhow::bail!("双色匹配只支持 blocks 或 sextant 字符集"),
+    };
+    let width = config.cols * CELL_WIDTH;
+    let height = rows * CELL_HEIGHT;
+    let colors = image.resample_colors(width, height)?;
+    let row_cells: Vec<Vec<AsciiCell>> = (0..rows)
+        .into_par_iter()
+        .map(|row| {
+            (0..config.cols)
+                .map(|col| {
+                    let x0 = col * CELL_WIDTH;
+                    let y0 = row * CELL_HEIGHT;
+                    let mut pixels = [[0_u8; 3]; CELL_PIXELS];
+                    for y in 0..CELL_HEIGHT {
+                        for x in 0..CELL_WIDTH {
+                            pixels[(y * CELL_WIDTH + x) as usize] =
+                                colors[((y0 + y) * width + x0 + x) as usize];
+                        }
+                    }
+                    let mut best = 0_usize;
+                    let mut best_error = f32::INFINITY;
+                    let mut best_fg = [0_u8; 3];
+                    let mut best_bg = [0_u8; 3];
+                    for (index, glyph) in glyphs.iter().enumerate() {
+                        let mut fg_sum = [0_u32; 3];
+                        let mut bg_sum = [0_u32; 3];
+                        let mut fg_count = 0_u32;
+                        let mut bg_count = 0_u32;
+                        for (pixel, coverage) in pixels.iter().zip(glyph.bitmap.iter()) {
+                            if *coverage >= 128 {
+                                for channel in 0..3 {
+                                    fg_sum[channel] += u32::from(pixel[channel]);
+                                }
+                                fg_count += 1;
+                            } else {
+                                for channel in 0..3 {
+                                    bg_sum[channel] += u32::from(pixel[channel]);
+                                }
+                                bg_count += 1;
+                            }
+                        }
+                        let fg = mean_color(fg_sum, fg_count, &pixels);
+                        let bg = mean_color(bg_sum, bg_count, &pixels);
+                        let mut error = 0.0_f32;
+                        for (pixel, coverage) in pixels.iter().zip(glyph.bitmap.iter()) {
+                            let weight = f32::from(*coverage) / 255.0;
+                            let reconstructed = std::array::from_fn(|channel| {
+                                (f32::from(fg[channel]) * weight
+                                    + f32::from(bg[channel]) * (1.0 - weight))
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8
+                            });
+                            error += redmean_distance(*pixel, reconstructed);
+                        }
+                        if error < best_error {
+                            best_error = error;
+                            best = index;
+                            best_fg = fg;
+                            best_bg = bg;
+                        }
+                    }
+                    let glyph = &glyphs[best];
+                    let (fg_color, bg_color) = if config.color {
+                        (best_fg, best_bg)
+                    } else {
+                        ([luma_u8(best_fg); 3], [luma_u8(best_bg); 3])
+                    };
+                    AsciiCell {
+                        ch: glyph.ch,
+                        fg_color,
+                        bg_color,
+                        density: glyph.density,
+                        bitmap: glyph.bitmap.clone(),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    Ok(row_cells.into_iter().flatten().collect())
+}
+
+fn mean_color(sum: [u32; 3], count: u32, pixels: &[[u8; 3]; CELL_PIXELS]) -> [u8; 3] {
+    if count == 0 {
+        let total = pixels.iter().fold([0_u32; 3], |mut total, pixel| {
+            for channel in 0..3 {
+                total[channel] += u32::from(pixel[channel]);
+            }
+            total
+        });
+        return total.map(|value| (value / CELL_PIXELS as u32) as u8);
+    }
+    sum.map(|value| (value / count) as u8)
+}
+
+fn luma_u8(color: [u8; 3]) -> u8 {
+    ((299 * u32::from(color[0]) + 587 * u32::from(color[1]) + 114 * u32::from(color[2])) / 1000)
+        as u8
+}
+
+fn redmean_distance(left: [u8; 3], right: [u8; 3]) -> f32 {
+    let rmean = (f32::from(left[0]) + f32::from(right[0])) * 0.5;
+    let dr = f32::from(left[0]) - f32::from(right[0]);
+    let dg = f32::from(left[1]) - f32::from(right[1]);
+    let db = f32::from(left[2]) - f32::from(right[2]);
+    (2.0 + rmean / 256.0) * dr * dr + 4.0 * dg * dg + (2.0 + (255.0 - rmean) / 256.0) * db * db
 }
 
 fn match_braille(
@@ -1059,6 +1186,7 @@ fn build_braille_cell(
     AsciiCell {
         ch: braille_char(bits),
         fg_color: foreground_color(image, config, position, density),
+        bg_color: [0, 0, 0],
         density,
         bitmap: atlas.braille_bitmap(bits),
     }
@@ -1463,6 +1591,7 @@ mod tests {
         directional_candidates, distance_squared, dither_weights, external_bounds, match_image,
         mean_region, nearest_glyph, ostromoukhov_coefficients, output_rows, top_glyph_candidates,
     };
+    use crate::cli::Charset;
     use crate::font_atlas::FontAtlas;
     use crate::preprocess::{CELL_HEIGHT, CELL_WIDTH, WorkImage, cell_region_bounds, preprocess};
     use crate::tone::ToneMap;
@@ -1486,6 +1615,8 @@ mod tests {
             dither,
             refine: false,
             aiss: false,
+            charset: Charset::Ascii,
+            dual_color: false,
             color: false,
             braille: false,
         }
@@ -1501,6 +1632,8 @@ mod tests {
     fn aiss_config() -> MatchConfig {
         MatchConfig {
             aiss: true,
+            charset: Charset::Ascii,
+            dual_color: false,
             ..config(false)
         }
     }
@@ -1794,6 +1927,8 @@ mod tests {
             dither: false,
             refine: false,
             aiss: false,
+            charset: Charset::Ascii,
+            dual_color: false,
             color: false,
             braille: false,
         };
@@ -2077,6 +2212,8 @@ mod tests {
             dither: true,
             refine: false,
             aiss: false,
+            charset: Charset::Ascii,
+            dual_color: false,
             color: false,
             braille: false,
         };

@@ -520,6 +520,42 @@ impl ProcessedImage {
         })
     }
 
+    /// 按输出分辨率双线性重采样原始 RGB；双色匹配不做色调映射。
+    pub fn resample_colors(&self, width: u32, height: u32) -> Result<Vec<[u8; 3]>> {
+        ensure!(width > 0 && height > 0, "工作图尺寸必须大于 0");
+        let pixel_count = usize::try_from(u64::from(width) * u64::from(height))
+            .map_err(|_| anyhow::anyhow!("工作图尺寸超出可处理范围"))?;
+        let sample = |x: isize, y: isize| {
+            let cx = x.clamp(0, self.width as isize - 1) as usize;
+            let cy = y.clamp(0, self.height as isize - 1) as usize;
+            self.colors[cy * self.width as usize + cx]
+        };
+        let mut output = Vec::with_capacity(pixel_count);
+        for y in 0..height {
+            let source_y = (y as f32 + 0.5) * self.height as f32 / height as f32 - 0.5;
+            let y0 = source_y.floor() as isize;
+            let ty = source_y - y0 as f32;
+            for x in 0..width {
+                let source_x = (x as f32 + 0.5) * self.width as f32 / width as f32 - 0.5;
+                let x0 = source_x.floor() as isize;
+                let tx = source_x - x0 as f32;
+                let top_left = sample(x0, y0);
+                let top_right = sample(x0 + 1, y0);
+                let bottom_left = sample(x0, y0 + 1);
+                let bottom_right = sample(x0 + 1, y0 + 1);
+                let color = std::array::from_fn(|channel| {
+                    let top = f32::from(top_left[channel]) * (1.0 - tx)
+                        + f32::from(top_right[channel]) * tx;
+                    let bottom = f32::from(bottom_left[channel]) * (1.0 - tx)
+                        + f32::from(bottom_right[channel]) * tx;
+                    (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8
+                });
+                output.push(color);
+            }
+        }
+        Ok(output)
+    }
+
     pub fn cell_highlight_color(&self, cols: u32, rows: u32, col: u32, row: u32) -> [u8; 3] {
         let (x0, y0, x1, y1) = self.cell_bounds(cols, rows, col, row);
 

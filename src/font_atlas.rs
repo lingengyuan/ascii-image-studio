@@ -22,6 +22,8 @@ pub struct CharGlyph {
 
 pub struct FontAtlas {
     ascii: Vec<CharGlyph>,
+    blocks: Vec<CharGlyph>,
+    sextants: Vec<CharGlyph>,
     braille_bitmaps: Vec<Arc<[u8]>>,
     /// 6 维共用的全局缩放系数；目标是原始子块覆盖率除以它。
     shape_scale: f32,
@@ -131,6 +133,8 @@ impl FontAtlas {
             .collect();
         Ok(Self {
             ascii,
+            blocks: build_blocks(),
+            sextants: build_sextants(),
             braille_bitmaps,
             shape_scale,
             max_ink,
@@ -140,6 +144,14 @@ impl FontAtlas {
 
     pub fn ascii(&self) -> &[CharGlyph] {
         &self.ascii
+    }
+
+    pub fn blocks(&self) -> &[CharGlyph] {
+        &self.blocks
+    }
+
+    pub fn sextants(&self) -> &[CharGlyph] {
+        &self.sextants
     }
 
     /// 字形向量与目标单元共用的覆盖率缩放系数。
@@ -174,6 +186,364 @@ impl FontAtlas {
     pub fn braille_bitmap(&self, bits: u8) -> Arc<[u8]> {
         self.braille_bitmaps[bits as usize].clone()
     }
+}
+
+const SEXTANTS: [(char, u8); 60] = [
+    ('\u{1fb00}', 1),
+    ('\u{1fb01}', 2),
+    ('\u{1fb02}', 3),
+    ('\u{1fb03}', 4),
+    ('\u{1fb04}', 5),
+    ('\u{1fb05}', 6),
+    ('\u{1fb06}', 7),
+    ('\u{1fb07}', 8),
+    ('\u{1fb08}', 9),
+    ('\u{1fb09}', 10),
+    ('\u{1fb0a}', 11),
+    ('\u{1fb0b}', 12),
+    ('\u{1fb0c}', 13),
+    ('\u{1fb0d}', 14),
+    ('\u{1fb0e}', 15),
+    ('\u{1fb0f}', 16),
+    ('\u{1fb10}', 17),
+    ('\u{1fb11}', 18),
+    ('\u{1fb12}', 19),
+    ('\u{1fb13}', 20),
+    ('\u{1fb14}', 22),
+    ('\u{1fb15}', 23),
+    ('\u{1fb16}', 24),
+    ('\u{1fb17}', 25),
+    ('\u{1fb18}', 26),
+    ('\u{1fb19}', 27),
+    ('\u{1fb1a}', 28),
+    ('\u{1fb1b}', 29),
+    ('\u{1fb1c}', 30),
+    ('\u{1fb1d}', 31),
+    ('\u{1fb1e}', 32),
+    ('\u{1fb1f}', 33),
+    ('\u{1fb20}', 34),
+    ('\u{1fb21}', 35),
+    ('\u{1fb22}', 36),
+    ('\u{1fb23}', 37),
+    ('\u{1fb24}', 38),
+    ('\u{1fb25}', 39),
+    ('\u{1fb26}', 40),
+    ('\u{1fb27}', 41),
+    ('\u{1fb28}', 43),
+    ('\u{1fb29}', 44),
+    ('\u{1fb2a}', 45),
+    ('\u{1fb2b}', 46),
+    ('\u{1fb2c}', 47),
+    ('\u{1fb2d}', 48),
+    ('\u{1fb2e}', 49),
+    ('\u{1fb2f}', 50),
+    ('\u{1fb30}', 51),
+    ('\u{1fb31}', 52),
+    ('\u{1fb32}', 53),
+    ('\u{1fb33}', 54),
+    ('\u{1fb34}', 55),
+    ('\u{1fb35}', 56),
+    ('\u{1fb36}', 57),
+    ('\u{1fb37}', 58),
+    ('\u{1fb38}', 59),
+    ('\u{1fb39}', 60),
+    ('\u{1fb3a}', 61),
+    ('\u{1fb3b}', 62),
+];
+
+fn geometric_glyph(ch: char, bitmap: [u8; 200]) -> CharGlyph {
+    let density = bitmap
+        .iter()
+        .map(|value| f32::from(*value) / 255.0)
+        .sum::<f32>()
+        / 200.0;
+    CharGlyph {
+        ch,
+        shape_vec: raw_shape_vector(&bitmap),
+        density,
+        density_norm: density,
+        bitmap: Arc::from(bitmap.to_vec()),
+    }
+}
+
+fn fill_rect(bitmap: &mut [u8; 200], x0: usize, x1: usize, y0: usize, y1: usize) {
+    for y in y0..y1 {
+        for x in x0..x1 {
+            bitmap[y * 10 + x] = 255;
+        }
+    }
+}
+
+fn block_bitmap(ch: char) -> Option<[u8; 200]> {
+    let mut bitmap = [0_u8; 200];
+    match ch {
+        ' ' => {}
+        '\u{2580}' => fill_rect(&mut bitmap, 0, 10, 0, 10),
+        '\u{2581}'..='\u{2588}' => {
+            let eighths = ch as u32 - '\u{2580}' as u32;
+            let top = 20 - (eighths * 20 / 8) as usize;
+            fill_rect(&mut bitmap, 0, 10, top, 20);
+        }
+        '\u{2589}'..='\u{258f}' => {
+            let eighths = 8 - (ch as u32 - '\u{2588}' as u32);
+            fill_rect(&mut bitmap, 0, (eighths * 10 / 8) as usize, 0, 20);
+        }
+        '\u{2590}' => fill_rect(&mut bitmap, 5, 10, 0, 20),
+        '\u{2591}' => {
+            for y in 0..20 {
+                for x in 0..10 {
+                    if (x + y) % 4 == 0 {
+                        bitmap[y * 10 + x] = 255;
+                    }
+                }
+            }
+        }
+        '\u{2592}' => {
+            for y in 0..20 {
+                for x in 0..10 {
+                    if (x + y) % 2 == 0 {
+                        bitmap[y * 10 + x] = 255;
+                    }
+                }
+            }
+        }
+        '\u{2593}' => {
+            for y in 0..20 {
+                for x in 0..10 {
+                    if (x + y) % 4 != 0 {
+                        bitmap[y * 10 + x] = 255;
+                    }
+                }
+            }
+        }
+        '\u{2594}' => fill_rect(&mut bitmap, 0, 10, 0, 3),
+        '\u{2595}' => fill_rect(&mut bitmap, 9, 10, 0, 20),
+        '\u{2596}'..='\u{259f}' => {
+            let mask = match ch {
+                '\u{2596}' => 4,
+                '\u{2597}' => 8,
+                '\u{2598}' => 1,
+                '\u{2599}' => 13,
+                '\u{259a}' => 9,
+                '\u{259b}' => 7,
+                '\u{259c}' => 11,
+                '\u{259d}' => 2,
+                '\u{259e}' => 6,
+                '\u{259f}' => 14,
+                _ => 0,
+            };
+            if mask & 1 != 0 {
+                fill_rect(&mut bitmap, 0, 5, 0, 10);
+            }
+            if mask & 2 != 0 {
+                fill_rect(&mut bitmap, 5, 10, 0, 10);
+            }
+            if mask & 4 != 0 {
+                fill_rect(&mut bitmap, 0, 5, 10, 20);
+            }
+            if mask & 8 != 0 {
+                fill_rect(&mut bitmap, 5, 10, 10, 20);
+            }
+        }
+        _ => return None,
+    }
+    Some(bitmap)
+}
+
+fn build_blocks() -> Vec<CharGlyph> {
+    let mut glyphs = Vec::with_capacity(33);
+    for code in 0x20_u32..=0x20 {
+        glyphs.push(geometric_glyph(char::from_u32(code).unwrap(), [0; 200]));
+    }
+    for code in 0x2580_u32..=0x259f {
+        let ch = char::from_u32(code).unwrap();
+        if let Some(bitmap) = block_bitmap(ch) {
+            glyphs.push(geometric_glyph(ch, bitmap));
+        }
+    }
+    glyphs
+}
+
+/// 斜切楔形块的点位。x 取 0、5、10，y 取 0、1/3、2/3、1 单元格高。
+#[derive(Clone, Copy)]
+enum WedgePoint {
+    UpperLeft,
+    UpperMiddleLeft,
+    UpperCentre,
+    UpperMiddleRight,
+    UpperRight,
+    LowerLeft,
+    LowerMiddleLeft,
+    LowerCentre,
+    LowerMiddleRight,
+    LowerRight,
+}
+
+impl WedgePoint {
+    fn coords(self) -> (f32, f32) {
+        match self {
+            Self::UpperLeft => (0.0, 0.0),
+            Self::UpperMiddleLeft => (0.0, 20.0 / 3.0),
+            Self::UpperCentre => (5.0, 0.0),
+            Self::UpperMiddleRight => (10.0, 20.0 / 3.0),
+            Self::UpperRight => (10.0, 0.0),
+            Self::LowerLeft => (0.0, 20.0),
+            Self::LowerMiddleLeft => (0.0, 40.0 / 3.0),
+            Self::LowerCentre => (5.0, 20.0),
+            Self::LowerMiddleRight => (10.0, 40.0 / 3.0),
+            Self::LowerRight => (10.0, 20.0),
+        }
+    }
+}
+
+// 每个字形：填充侧所在的角，斜线起点，斜线终点。名称见 Unicode 18.0。
+const WEDGES: [(char, WedgePoint, WedgePoint, WedgePoint); 44] = {
+    use WedgePoint::*;
+    [
+        ('\u{1fb3c}', LowerLeft, LowerMiddleLeft, LowerCentre),
+        ('\u{1fb3d}', LowerLeft, LowerMiddleLeft, LowerRight),
+        ('\u{1fb3e}', LowerLeft, UpperMiddleLeft, LowerCentre),
+        ('\u{1fb3f}', LowerLeft, UpperMiddleLeft, LowerRight),
+        ('\u{1fb40}', LowerLeft, UpperLeft, LowerCentre),
+        ('\u{1fb41}', LowerRight, UpperMiddleLeft, UpperCentre),
+        ('\u{1fb42}', LowerRight, UpperMiddleLeft, UpperRight),
+        ('\u{1fb43}', LowerRight, LowerMiddleLeft, UpperCentre),
+        ('\u{1fb44}', LowerRight, LowerMiddleLeft, UpperRight),
+        ('\u{1fb45}', LowerRight, LowerLeft, UpperCentre),
+        ('\u{1fb46}', LowerRight, LowerMiddleLeft, UpperMiddleRight),
+        ('\u{1fb47}', LowerRight, LowerCentre, LowerMiddleRight),
+        ('\u{1fb48}', LowerRight, LowerLeft, LowerMiddleRight),
+        ('\u{1fb49}', LowerRight, LowerCentre, UpperMiddleRight),
+        ('\u{1fb4a}', LowerRight, LowerLeft, UpperMiddleRight),
+        ('\u{1fb4b}', LowerRight, LowerCentre, UpperRight),
+        ('\u{1fb4c}', LowerLeft, UpperCentre, UpperMiddleRight),
+        ('\u{1fb4d}', LowerLeft, UpperLeft, UpperMiddleRight),
+        ('\u{1fb4e}', LowerLeft, UpperCentre, LowerMiddleRight),
+        ('\u{1fb4f}', LowerLeft, UpperLeft, LowerMiddleRight),
+        ('\u{1fb50}', LowerLeft, UpperCentre, LowerRight),
+        ('\u{1fb51}', LowerLeft, UpperMiddleLeft, LowerMiddleRight),
+        ('\u{1fb52}', UpperRight, LowerMiddleLeft, LowerCentre),
+        ('\u{1fb53}', UpperRight, LowerMiddleLeft, LowerRight),
+        ('\u{1fb54}', UpperRight, UpperMiddleLeft, LowerCentre),
+        ('\u{1fb55}', UpperRight, UpperMiddleLeft, LowerRight),
+        ('\u{1fb56}', UpperRight, UpperLeft, LowerCentre),
+        ('\u{1fb57}', UpperLeft, UpperMiddleLeft, UpperCentre),
+        ('\u{1fb58}', UpperLeft, UpperMiddleLeft, UpperRight),
+        ('\u{1fb59}', UpperLeft, LowerMiddleLeft, UpperCentre),
+        ('\u{1fb5a}', UpperLeft, LowerMiddleLeft, UpperRight),
+        ('\u{1fb5b}', UpperLeft, LowerLeft, UpperCentre),
+        ('\u{1fb5c}', UpperLeft, LowerMiddleLeft, UpperMiddleRight),
+        ('\u{1fb5d}', UpperLeft, LowerCentre, LowerMiddleRight),
+        ('\u{1fb5e}', UpperLeft, LowerLeft, LowerMiddleRight),
+        ('\u{1fb5f}', UpperLeft, LowerCentre, UpperMiddleRight),
+        ('\u{1fb60}', UpperLeft, LowerLeft, UpperMiddleRight),
+        ('\u{1fb61}', UpperLeft, LowerCentre, UpperRight),
+        ('\u{1fb62}', UpperRight, UpperCentre, UpperMiddleRight),
+        ('\u{1fb63}', UpperRight, UpperLeft, UpperMiddleRight),
+        ('\u{1fb64}', UpperRight, UpperCentre, LowerMiddleRight),
+        ('\u{1fb65}', UpperRight, UpperLeft, LowerMiddleRight),
+        ('\u{1fb66}', UpperRight, UpperCentre, LowerRight),
+        ('\u{1fb67}', UpperRight, UpperMiddleLeft, LowerMiddleRight),
+    ]
+};
+
+fn wedge_bitmap(anchor: WedgePoint, start: WedgePoint, end: WedgePoint) -> [u8; 200] {
+    let (ax, ay) = anchor.coords();
+    let (x0, y0) = start.coords();
+    let (x1, y1) = end.coords();
+    let anchor_side = (y1 - y0) * (ax - x0) - (x1 - x0) * (ay - y0);
+    let mut bitmap = [0_u8; 200];
+    for y in 0..20 {
+        for x in 0..10 {
+            let side = (y1 - y0) * (x as f32 + 0.5 - x0) - (x1 - x0) * (y as f32 + 0.5 - y0);
+            if side * anchor_side >= 0.0 {
+                bitmap[y * 10 + x] = 255;
+            }
+        }
+    }
+    bitmap
+}
+
+fn triangle_bitmap(orientation: char) -> [u8; 200] {
+    let mut bitmap = [0_u8; 200];
+    for y in 0..20 {
+        for x in 0..10 {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let inside = match orientation {
+                'l' => px <= (py / 2.0).min(10.0 - py / 2.0),
+                'r' => px >= 10.0 - (py / 2.0).min(10.0 - py / 2.0),
+                'u' => py <= (2.0 * px).min(20.0 - 2.0 * px),
+                _ => py >= 20.0 - (2.0 * px).min(20.0 - 2.0 * px),
+            };
+            if inside {
+                bitmap[y * 10 + x] = 255;
+            }
+        }
+    }
+    bitmap
+}
+
+fn build_sextants() -> Vec<CharGlyph> {
+    let mut glyphs = Vec::with_capacity(114);
+    glyphs.push(geometric_glyph(' ', [0; 200]));
+    for (ch, mask) in SEXTANTS {
+        let mut bitmap = [0_u8; 200];
+        for bit in 0..6 {
+            if mask & (1 << bit) == 0 {
+                continue;
+            }
+            let column = bit % 2;
+            let band = bit / 2;
+            let x0 = column * 5;
+            let y0 = match band {
+                0 => 0,
+                1 => 6,
+                _ => 13,
+            };
+            let y1 = match band {
+                0 => 6,
+                1 => 13,
+                _ => 20,
+            };
+            fill_rect(&mut bitmap, x0, x0 + 5, y0, y1);
+        }
+        glyphs.push(geometric_glyph(ch, bitmap));
+    }
+    for (ch, anchor, start, end) in WEDGES {
+        glyphs.push(geometric_glyph(ch, wedge_bitmap(anchor, start, end)));
+    }
+    let left = triangle_bitmap('l');
+    let upper = triangle_bitmap('u');
+    let right = triangle_bitmap('r');
+    let lower = triangle_bitmap('d');
+    for (ch, triangle) in [
+        ('\u{1fb6c}', left),
+        ('\u{1fb6d}', upper),
+        ('\u{1fb6e}', right),
+        ('\u{1fb6f}', lower),
+    ] {
+        glyphs.push(geometric_glyph(ch, triangle));
+    }
+    let complement = |triangle: [u8; 200]| {
+        let mut bitmap = [0_u8; 200];
+        for (value, source) in bitmap.iter_mut().zip(triangle) {
+            *value = 255 - source;
+        }
+        bitmap
+    };
+    for (ch, triangle) in [
+        ('\u{1fb68}', complement(left)),
+        ('\u{1fb69}', complement(upper)),
+        ('\u{1fb6a}', complement(right)),
+        ('\u{1fb6b}', complement(lower)),
+    ] {
+        glyphs.push(geometric_glyph(ch, triangle));
+    }
+    let mut full = [0_u8; 200];
+    fill_rect(&mut full, 0, 10, 0, 20);
+    glyphs.push(geometric_glyph('\u{2588}', full));
+    glyphs
 }
 
 fn choose_font_size(font: &Font) -> Result<(f32, f32)> {
@@ -353,6 +723,52 @@ mod tests {
         assert!(!atlas.aiss_descriptors_ready());
         assert_eq!(atlas.aiss_descriptors()[index], expected);
         assert!(atlas.aiss_descriptors_ready());
+    }
+
+    #[test]
+    fn geometric_charsets_have_complete_masks() {
+        let atlas = FontAtlas::load().unwrap();
+        assert_eq!(atlas.blocks().len(), 33);
+        assert_eq!(atlas.sextants().len(), 114);
+        for charset in [atlas.blocks(), atlas.sextants()] {
+            assert!(charset.iter().all(|glyph| glyph.bitmap.len() == 200));
+            let distinct: std::collections::HashSet<&[u8]> =
+                charset.iter().map(|glyph| glyph.bitmap.as_ref()).collect();
+            assert_eq!(distinct.len(), charset.len(), "charset={}", charset[1].ch);
+        }
+        let full = atlas
+            .sextants()
+            .iter()
+            .find(|glyph| glyph.ch == '\u{2588}')
+            .unwrap();
+        assert!((full.density - 1.0).abs() < 1.0e-6);
+        assert!(atlas.blocks()[0].bitmap.iter().all(|value| *value == 0));
+    }
+
+    #[test]
+    fn diagonal_wedges_fill_the_named_side() {
+        let atlas = FontAtlas::load().unwrap();
+        let glyph = |ch| {
+            atlas
+                .sextants()
+                .iter()
+                .find(|glyph| glyph.ch == ch)
+                .unwrap()
+        };
+        let bottom_left = 19 * CELL_WIDTH as usize;
+        let bottom_right = 19 * CELL_WIDTH as usize + CELL_WIDTH as usize - 1;
+
+        let lower_left = glyph('\u{1fb40}');
+        assert_eq!(lower_left.bitmap[bottom_left], 255);
+        assert_eq!(lower_left.bitmap[0], 0);
+
+        let upper_right = glyph('\u{1fb56}');
+        assert_eq!(upper_right.bitmap[bottom_left], 0);
+        assert_eq!(upper_right.bitmap[0], 255);
+
+        let corner = glyph('\u{1fb47}');
+        assert_eq!(corner.bitmap[bottom_right], 255);
+        assert_eq!(corner.bitmap[0], 0);
     }
 
     #[test]

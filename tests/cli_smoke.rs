@@ -569,6 +569,90 @@ fn cli_aiss_is_opt_in_deterministic_and_conflicts_with_other_ascii_modes() {
 }
 
 #[test]
+fn cli_dual_color_charsets_render_colored_backgrounds_and_are_deterministic() {
+    let temp = TempDir::new("dual-color");
+    let input = temp.path("gradient.png");
+    write_gradient(&input);
+
+    let plain_png = temp.path("plain.png");
+    assert_success(&run(&[
+        path_text(&input),
+        "--width",
+        "16",
+        "--output",
+        path_text(&plain_png),
+    ]));
+
+    for charset in ["blocks", "sextant"] {
+        let first = temp.path(&format!("{charset}-1.png"));
+        let second = temp.path(&format!("{charset}-2.png"));
+        let ans = temp.path(&format!("{charset}.ans"));
+        for path in [&first, &second] {
+            assert_success(&run(&[
+                path_text(&input),
+                "--width",
+                "16",
+                "--charset",
+                charset,
+                "--dual-color",
+                "--color",
+                "--output",
+                path_text(path),
+            ]));
+        }
+        assert_eq!(
+            fs::read(&first).unwrap(),
+            fs::read(&second).unwrap(),
+            "charset={charset}"
+        );
+        let rendered = image::open(&first).unwrap().to_rgb8();
+        assert!(
+            rendered
+                .pixels()
+                .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+            "charset={charset} 没有输出彩色背景"
+        );
+
+        assert_success(&run(&[
+            path_text(&input),
+            "--width",
+            "16",
+            "--charset",
+            charset,
+            "--dual-color",
+            "--color",
+            "--output",
+            path_text(&ans),
+        ]));
+        let ansi = fs::read_to_string(&ans).unwrap();
+        assert!(ansi.contains("\u{1b}[48;2;"), "charset={charset}");
+    }
+
+    let without_dual = run(&[
+        path_text(&input),
+        "--width",
+        "16",
+        "--charset",
+        "blocks",
+        "--output",
+        path_text(&temp.path("bad.png")),
+    ]);
+    assert_eq!(without_dual.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&without_dual.stderr).contains("--dual-color"));
+
+    let dual_ascii = run(&[
+        path_text(&input),
+        "--width",
+        "16",
+        "--dual-color",
+        "--output",
+        path_text(&temp.path("bad-ascii.png")),
+    ]);
+    assert_eq!(dual_ascii.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&dual_ascii.stderr).contains("blocks"));
+}
+
+#[test]
 fn cli_braille_dither_changes_uniform_gray_output() {
     let temp = TempDir::new("braille-dither");
     let input = temp.path("gray.png");
